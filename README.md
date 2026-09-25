@@ -31,7 +31,7 @@ Tested on an Apple M4 with macOS 27. Anything not listed here is untested — re
 | --- | --- | --- | --- |
 | Fable II | 4D5307F1 | **Playable** | ~20–28 FPS. Hero, dog and clothing textures correct. `metal_force_linear_filter = true` recommended. |
 | Forza Horizon | 4D5309C9 | **Playable** | Races complete, ~20–29 FPS. Short stutters while new shaders compile. A crash after returning to the menu several times is under investigation. |
-| The Darkness | 545407EE | **In-game** | Menus work and gameplay is reached, but heavy graphical artifacts (broken, stretched polygons across the screen) make it barely playable. Tested with the USA/Europe disc, v1.0. |
+| The Darkness | 545407EE | **In-game** | Menus and gameplay work; the screen band and flickering polygons are fixed since v0.1.1. Remaining: a crosshatch pattern over many textures, ~24 FPS in the intro (full GPU sync is enabled for this title). Tested with the USA/Europe disc, v1.0. |
 
 ## What is in this build
 
