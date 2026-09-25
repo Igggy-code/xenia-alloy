@@ -107,7 +107,19 @@ if(GIT_FOUND)
     execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --abbrev-ref HEAD
       WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
       OUTPUT_VARIABLE XE_BUILD_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+    # Release builds: when HEAD is tagged (for example v0.1.0), show the tag
+    # instead of the branch name.
+    execute_process(COMMAND "${GIT_EXECUTABLE}" describe --tags --exact-match HEAD
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" RESULT_VARIABLE _git_tag_result
+      OUTPUT_VARIABLE _git_tag OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(_git_tag_result EQUAL 0 AND _git_tag)
+      set(XE_BUILD_BRANCH "${_git_tag}")
+      string(REGEX REPLACE "^v" "" XE_APP_VERSION "${_git_tag}")
+    endif()
   endif()
+endif()
+if(NOT XE_APP_VERSION)
+  set(XE_APP_VERSION "0.1.0")
 endif()
 configure_file(cmake/version.h.in "${CMAKE_BINARY_DIR}/version.h" @ONLY)
 
