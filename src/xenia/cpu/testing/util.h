@@ -34,7 +34,8 @@ using xe::cpu::ppc::PPCContext;
 
 class TestFunction {
  public:
-  TestFunction(std::function<void(hir::HIRBuilder& b)> generator) {
+  TestFunction(std::function<void(hir::HIRBuilder& b)> generator,
+               bool skip_cf_simplification = false) {
     memory.reset(new Memory());
     memory->Initialize();
 
@@ -59,7 +60,7 @@ class TestFunction {
           [generator](hir::HIRBuilder& b) {
             generator(b);
             return true;
-          });
+          }, skip_cf_simplification);
       processor->AddModule(std::move(module));
       processor->backend()->CommitExecutableRange(0x80000000, 0x80010000);
     }

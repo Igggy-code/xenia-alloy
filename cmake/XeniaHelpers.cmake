@@ -5,7 +5,7 @@ include(CMakeParseArguments)
 
 # Platform suffix lists for file filtering
 set(XE_PLATFORM_SUFFIXES
-  _win _linux _posix _gnulinux _x11 _gtk _android _mac _amd64 _x64 _arm64
+  _win _linux _posix _gnulinux _x11 _gtk _android _mac _ios _amd64 _x64 _arm64
 )
 
 # xe_platform_sources(target base_path [RECURSIVE])
@@ -63,6 +63,22 @@ function(xe_platform_sources target base_path)
     file(${glob_mode} _plat_sources      "${base_path}/*_win.h"
       "${base_path}/*_win.cc"
     )
+  elseif(APPLE)
+    file(${glob_mode} _plat_sources
+      "${base_path}/*_posix.h"
+      "${base_path}/*_posix.cc"
+      "${base_path}/*_mac.h"
+      "${base_path}/*_mac.cc"
+      "${base_path}/*.mm"
+    )
+    # A Darwin implementation replaces the generic POSIX one. Compiling both
+    # would duplicate symbols and pull Linux-only system calls into macOS.
+    foreach(_mac_source IN LISTS _plat_sources)
+      if(_mac_source MATCHES "_mac\\.(cc|mm)$")
+        string(REGEX REPLACE "_mac\\.(cc|mm)$" "_posix.cc" _posix_source "${_mac_source}")
+        list(REMOVE_ITEM _plat_sources "${_posix_source}")
+      endif()
+    endforeach()
   elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     file(${glob_mode} _plat_sources      "${base_path}/*_posix.h"
       "${base_path}/*_posix.cc"
@@ -258,6 +274,9 @@ function(xe_test_suite name base_path)
   if(WIN32)
     target_sources(${name} PRIVATE
       ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_win.cc)
+  elseif(APPLE)
+    target_sources(${name} PRIVATE
+      ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_mac.cc)
   else()
     target_sources(${name} PRIVATE
       ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_posix.cc)
@@ -282,5 +301,13 @@ function(xe_test_suite name base_path)
     target_compile_options(${name} PRIVATE /Zi)
   endif()
 
+  # Tests that execute generated code need the same JIT entitlement as the app.
+  if(APPLE)
+    add_custom_command(TARGET ${name} POST_BUILD
+      COMMAND /usr/bin/codesign --force --sign -
+        --entitlements "${PROJECT_SOURCE_DIR}/xenia.entitlements"
+        "$<TARGET_FILE:${name}>"
+      VERBATIM)
+  endif()
   catch_discover_tests(${name})
 endfunction()

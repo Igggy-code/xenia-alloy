@@ -65,6 +65,87 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   Processor* processor() const { return processor_; }
   A64Backend* backend() const { return backend_; }
 
+  // Conditional branches reach only +-1 MiB (b.cond, cbz, cbnz) or +-32 KiB
+  // (tbz, tbnz). Very large guest functions are re-emitted with far_branches_
+  // set, where each of them becomes an inverted short skip over an
+  // unconditional branch (+-128 MiB).
+  using Xbyak_aarch64::CodeGenerator::b;
+  using Xbyak_aarch64::CodeGenerator::cbnz;
+  using Xbyak_aarch64::CodeGenerator::cbz;
+  using Xbyak_aarch64::CodeGenerator::tbnz;
+  using Xbyak_aarch64::CodeGenerator::tbz;
+  void b(const Xbyak_aarch64::Cond cond, const Xbyak_aarch64::Label& label) {
+    if (!far_branches_ || cond == Xbyak_aarch64::AL ||
+        cond == Xbyak_aarch64::NV) {
+      CodeGenerator::b(cond, label);
+      return;
+    }
+    Xbyak_aarch64::Label skip;
+    CodeGenerator::b(static_cast<Xbyak_aarch64::Cond>(cond ^ 1), skip);
+    CodeGenerator::b(label);
+    L(skip);
+  }
+  template <typename R>
+  void FarCompareBranch(bool branch_if_zero, const R& rt,
+                        const Xbyak_aarch64::Label& label) {
+    Xbyak_aarch64::Label skip;
+    if (branch_if_zero) {
+      CodeGenerator::cbnz(rt, skip);
+    } else {
+      CodeGenerator::cbz(rt, skip);
+    }
+    CodeGenerator::b(label);
+    L(skip);
+  }
+  template <typename R>
+  void FarTestBranch(bool branch_if_zero, const R& rt, uint32_t imm,
+                     const Xbyak_aarch64::Label& label) {
+    Xbyak_aarch64::Label skip;
+    if (branch_if_zero) {
+      CodeGenerator::tbnz(rt, imm, skip);
+    } else {
+      CodeGenerator::tbz(rt, imm, skip);
+    }
+    CodeGenerator::b(label);
+    L(skip);
+  }
+  void cbz(const Xbyak_aarch64::WReg& rt, const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarCompareBranch(true, rt, label)
+                  : CodeGenerator::cbz(rt, label);
+  }
+  void cbz(const Xbyak_aarch64::XReg& rt, const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarCompareBranch(true, rt, label)
+                  : CodeGenerator::cbz(rt, label);
+  }
+  void cbnz(const Xbyak_aarch64::WReg& rt, const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarCompareBranch(false, rt, label)
+                  : CodeGenerator::cbnz(rt, label);
+  }
+  void cbnz(const Xbyak_aarch64::XReg& rt, const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarCompareBranch(false, rt, label)
+                  : CodeGenerator::cbnz(rt, label);
+  }
+  void tbz(const Xbyak_aarch64::WReg& rt, const uint32_t imm,
+           const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarTestBranch(true, rt, imm, label)
+                  : CodeGenerator::tbz(rt, imm, label);
+  }
+  void tbz(const Xbyak_aarch64::XReg& rt, const uint32_t imm,
+           const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarTestBranch(true, rt, imm, label)
+                  : CodeGenerator::tbz(rt, imm, label);
+  }
+  void tbnz(const Xbyak_aarch64::WReg& rt, const uint32_t imm,
+            const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarTestBranch(false, rt, imm, label)
+                  : CodeGenerator::tbnz(rt, imm, label);
+  }
+  void tbnz(const Xbyak_aarch64::XReg& rt, const uint32_t imm,
+            const Xbyak_aarch64::Label& label) {
+    far_branches_ ? FarTestBranch(false, rt, imm, label)
+                  : CodeGenerator::tbnz(rt, imm, label);
+  }
+
   bool Emit(GuestFunction* function, hir::HIRBuilder* builder,
             uint32_t debug_info_flags, FunctionDebugInfo* debug_info,
             void** out_code_address, size_t* out_code_size,
@@ -72,7 +153,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
  public:
   // Reserved: sp, x19 (backend context), x20 (context), x21 (membase)
-  // Scratch: x0-x18 (caller-saved), v0-v3
+  // Scratch: x0-x17 (x18 is reserved by Darwin), v0-v3
   // Available GPRs for register allocator: x22-x28
   static constexpr int GPR_COUNT = 7;
   // Available VEC regs: v4-v15, v16-v31
@@ -162,6 +243,8 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
   void* Emplace(const EmitFunctionInfo& func_info,
                 GuestFunction* function = nullptr);
   bool Emit(hir::HIRBuilder* builder, EmitFunctionInfo& func_info);
+  // Drops all partially emitted code, tail code and labels.
+  void DiscardEmittedCode();
 
  protected:
   Processor* processor_ = nullptr;
@@ -194,6 +277,7 @@ class A64Emitter : public Xbyak_aarch64::CodeGenerator {
 
   FPCRMode fpcr_mode_ = FPCRMode::Unknown;
   bool synchronize_stack_on_next_instruction_ = false;
+  bool far_branches_ = false;
 };
 
 }  // namespace a64

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.20)
 if(APPLE)
-  project(xenia LANGUAGES C CXX OBJCXX)
+  project(xenia LANGUAGES C CXX OBJC OBJCXX)
   set(CMAKE_OBJCXX_STANDARD 20)
   set(CMAKE_OBJCXX_STANDARD_REQUIRED ON)
 else()
@@ -16,7 +16,17 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 # - VS generator: CMAKE_GENERATOR_PLATFORM (from -A flag) takes priority.
 # - Ninja/Makefiles: CMAKE_SYSTEM_PROCESSOR (set via -DCMAKE_SYSTEM_NAME
 #   + -DCMAKE_SYSTEM_PROCESSOR for cross-compile, or auto-detected natively).
-if(CMAKE_GENERATOR_PLATFORM)
+if(APPLE AND CMAKE_OSX_ARCHITECTURES)
+  if(CMAKE_OSX_ARCHITECTURES STREQUAL "arm64")
+    set(XE_TARGET_AARCH64 TRUE)
+    set(XE_TARGET_X86_64 FALSE)
+  elseif(CMAKE_OSX_ARCHITECTURES STREQUAL "x86_64")
+    set(XE_TARGET_AARCH64 FALSE)
+    set(XE_TARGET_X86_64 TRUE)
+  else()
+    message(FATAL_ERROR "Build each macOS CPU backend separately: use arm64 or x86_64")
+  endif()
+elseif(CMAKE_GENERATOR_PLATFORM)
   if(CMAKE_GENERATOR_PLATFORM STREQUAL "ARM64")
     set(XE_TARGET_AARCH64 TRUE)
     set(XE_TARGET_X86_64 FALSE)
@@ -81,6 +91,25 @@ file(MAKE_DIRECTORY "${PROJECT_SOURCE_DIR}/scratch")
 
 # Python for shader compilation scripts
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
+
+# The xb wrapper used to supply version.h. Direct CMake builds need it too.
+set(XE_BUILD_BRANCH "source-archive")
+set(XE_BUILD_COMMIT "unknown")
+set(XE_BUILD_COMMIT_SHORT "unknown")
+find_package(Git QUIET)
+if(GIT_FOUND)
+  execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse HEAD
+    WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}" RESULT_VARIABLE _git_result
+    OUTPUT_VARIABLE _git_commit OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+  if(_git_result EQUAL 0)
+    set(XE_BUILD_COMMIT "${_git_commit}")
+    string(SUBSTRING "${XE_BUILD_COMMIT}" 0 8 XE_BUILD_COMMIT_SHORT)
+    execute_process(COMMAND "${GIT_EXECUTABLE}" rev-parse --abbrev-ref HEAD
+      WORKING_DIRECTORY "${PROJECT_SOURCE_DIR}"
+      OUTPUT_VARIABLE XE_BUILD_BRANCH OUTPUT_STRIP_TRAILING_WHITESPACE)
+  endif()
+endif()
+configure_file(cmake/version.h.in "${CMAKE_BINARY_DIR}/version.h" @ONLY)
 
 # Include helpers
 include(cmake/XeniaHelpers.cmake)
@@ -294,6 +323,7 @@ else()
   # linker/archiver LTO plugin version mismatch with clang's bitcode)
   add_compile_options($<$<CONFIG:Release>:-flto=thin>)
   add_link_options($<$<CONFIG:Release>:-flto=thin>)
+  if(NOT APPLE)
   add_link_options($<$<CONFIG:Release>:-fuse-ld=lld>)
   find_program(LLVM_AR NAMES llvm-ar)
   find_program(LLVM_RANLIB NAMES llvm-ranlib)
@@ -302,6 +332,7 @@ else()
   endif()
   if(LLVM_RANLIB)
     set(CMAKE_RANLIB "${LLVM_RANLIB}" CACHE FILEPATH "" FORCE)
+  endif()
   endif()
   # No symbols in release on non-Windows
   string(REPLACE "-g" "" CMAKE_C_FLAGS_RELEASE "${CMAKE_C_FLAGS_RELEASE}")

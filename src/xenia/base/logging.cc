@@ -447,7 +447,15 @@ void InitializeLogging(const std::string_view app_name) {
   if (cvars::log_file.empty()) {
     // Default to app name.
     auto file_name = fmt::format("{}.log", app_name);
+#if XE_PLATFORM_MAC
+    // Contents/MacOS is signed executable content. Writing logs there both
+    // invalidates the app bundle and fails for read-only installations.
+    auto file_path = xe::filesystem::GetUserFolder() / "Xenia" / "logs" /
+                     file_name;
+    xe::filesystem::CreateParentFolder(file_path);
+#else
     auto file_path = xe::filesystem::GetExecutableFolder() / file_name;
+#endif
     log_file = xe::filesystem::OpenFile(file_path, "wt");
   } else {
     xe::filesystem::CreateParentFolder(cvars::log_file);

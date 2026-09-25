@@ -522,6 +522,17 @@ TEST_CASE("map_view", "[virtual_memory_mapping]") {
   REQUIRE(memory != xe::memory::kFileMappingHandleInvalid);
 
   uintptr_t address = 0x100000000;
+#if XE_PLATFORM_MAC
+  // The conventional test address can contain the Mach-O executable on macOS.
+  // Obtain a free host-selected address, then exercise an exact-address view.
+  void* reservation = xe::memory::AllocFixed(
+      nullptr, xe::memory::page_size(), xe::memory::AllocationType::kReserve,
+      xe::memory::PageAccess::kNoAccess);
+  REQUIRE(reservation != nullptr);
+  address = reinterpret_cast<uintptr_t>(reservation);
+  REQUIRE(xe::memory::DeallocFixed(reservation, xe::memory::page_size(),
+                                  xe::memory::DeallocationType::kRelease));
+#endif
   auto view =
       xe::memory::MapFileView(memory, reinterpret_cast<void*>(address), length,
                               xe::memory::PageAccess::kReadWrite, 0);
@@ -539,6 +550,17 @@ TEST_CASE("read_write_view", "[virtual_memory_mapping]") {
   REQUIRE(memory != xe::memory::kFileMappingHandleInvalid);
 
   uintptr_t address = 0x100000000;
+#if XE_PLATFORM_MAC
+  // The conventional test address can contain the Mach-O executable on macOS.
+  // Obtain a free host-selected address, then exercise an exact-address view.
+  void* reservation = xe::memory::AllocFixed(
+      nullptr, xe::memory::page_size(), xe::memory::AllocationType::kReserve,
+      xe::memory::PageAccess::kNoAccess);
+  REQUIRE(reservation != nullptr);
+  address = reinterpret_cast<uintptr_t>(reservation);
+  REQUIRE(xe::memory::DeallocFixed(reservation, xe::memory::page_size(),
+                                  xe::memory::DeallocationType::kRelease));
+#endif
   auto view =
       xe::memory::MapFileView(memory, reinterpret_cast<void*>(address), length,
                               xe::memory::PageAccess::kReadWrite, 0);

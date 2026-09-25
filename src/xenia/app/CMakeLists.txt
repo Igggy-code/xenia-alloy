@@ -2,6 +2,8 @@
 
 if(WIN32)
   add_executable(xenia-app WIN32)
+elseif(APPLE)
+  add_executable(xenia-app MACOSX_BUNDLE)
 else()
   add_executable(xenia-app)
 endif()
@@ -31,6 +33,10 @@ if(WIN32)
       PROPERTIES COMPILE_OPTIONS "/arch:SSE2"
     )
   endif()
+elseif(APPLE)
+  target_sources(xenia-app PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/xenia/base/main_init_mac.cc
+    ${PROJECT_SOURCE_DIR}/src/xenia/ui/windowed_app_main_mac.cc)
 else()
   target_sources(xenia-app PRIVATE
     ${PROJECT_SOURCE_DIR}/src/xenia/base/main_init_posix.cc
@@ -87,6 +93,18 @@ if(NOT APPLE)
   )
 endif()
 
+# Native macOS graphics and application metadata.
+if(APPLE)
+  target_link_libraries(xenia-app PRIVATE xenia-gpu-metal xenia-ui-metal
+    "-framework Cocoa" "-framework Metal" "-framework QuartzCore")
+  set_target_properties(xenia-app PROPERTIES
+    MACOSX_BUNDLE_GUI_IDENTIFIER "jp.xenia.canary.mac"
+    MACOSX_BUNDLE_BUNDLE_NAME "Xenia Canary"
+    MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info-mac.plist"
+    BUILD_RPATH "@executable_path/../Frameworks"
+    INSTALL_RPATH "@executable_path/../Frameworks")
+endif()
+
 # Non-Android specific (always true for Windows/Linux)
 target_link_libraries(xenia-app PRIVATE
   xenia-app-discord
@@ -123,3 +141,33 @@ elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 
 xe_target_defaults(xenia-app)
+
+if(APPLE)
+  find_package(Python3 REQUIRED COMPONENTS Interpreter)
+  set(_mac_bundle_libraries)
+  foreach(_library metalirconverter dxilconv)
+    if(TARGET ${_library})
+      list(APPEND _mac_bundle_libraries --library "$<TARGET_FILE:${_library}>")
+    endif()
+  endforeach()
+  set(_mac_bundle_licenses --license "${PROJECT_SOURCE_DIR}/LICENSE" "Xenia.txt")
+  if(TARGET metalirconverter)
+    list(APPEND _mac_bundle_licenses
+      --license "${PROJECT_SOURCE_DIR}/third_party/metal-shader-converter/include/LICENSE.txt" "MetalShaderConverter.txt"
+      --license "${PROJECT_SOURCE_DIR}/third_party/metal-shader-converter/include/metal_irconverter/LICENSE.txt" "MetalIRConverter.txt"
+      --license "${PROJECT_SOURCE_DIR}/third_party/metal-shader-converter/include/metal_irconverter_runtime/LICENSE.txt" "MetalIRConverterRuntime.txt")
+  endif()
+  if(TARGET dxilconv)
+    list(APPEND _mac_bundle_licenses
+      --license "${PROJECT_SOURCE_DIR}/third_party/DirectXShaderCompiler-mac/LICENSE.TXT" "DirectXShaderCompiler.txt"
+      --license "${PROJECT_SOURCE_DIR}/third_party/DirectXShaderCompiler-mac/ThirdPartyNotices.txt" "DirectXShaderCompilerThirdPartyNotices.txt")
+  endif()
+  target_link_options(xenia-app PRIVATE "-Wl,-headerpad_max_install_names")
+  add_custom_command(TARGET xenia-app POST_BUILD
+    COMMAND ${Python3_EXECUTABLE} "${CMAKE_CURRENT_SOURCE_DIR}/package_macos.py"
+      --app "$<TARGET_BUNDLE_DIR:xenia-app>"
+      --executable "$<TARGET_FILE:xenia-app>"
+      --entitlements "${PROJECT_SOURCE_DIR}/xenia.entitlements"
+      ${_mac_bundle_libraries} ${_mac_bundle_licenses}
+    VERBATIM)
+endif()

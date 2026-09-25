@@ -1,0 +1,44 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 625f9971..60b799fa 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -111,8 +111,9 @@ endif()
+ option(ENABLE_SPIRV_CODEGEN "Enables SPIR-V code generation." OFF)
+ option(SPIRV_BUILD_TESTS "Build targets for the SPIR-V unit tests." OFF)
+ 
+-# Enable SPIR-V CodeGen for Linux by default.
+-if(NOT WIN32)
++# Preserve the existing Linux default, but allow the macOS DXBC-only build
++# to disable the unrelated SPIR-V backend and its dependencies.
++if(UNIX AND NOT APPLE)
+   set(ENABLE_SPIRV_CODEGEN ON)
+ endif()
+ 
+@@ -746,4 +747,4 @@ endif()
+ 
+ if (NOT "${DXC_CMAKE_ENDS_INCLUDE}" STREQUAL "")
+   include(${DXC_CMAKE_ENDS_INCLUDE})
+-endif()
+\ No newline at end of file
++endif()
+diff --git a/include/llvm/ADT/StringRef.h b/include/llvm/ADT/StringRef.h
+index ad630646..152fcf1d 100644
+--- a/include/llvm/ADT/StringRef.h
++++ b/include/llvm/ADT/StringRef.h
+@@ -572,6 +572,8 @@ namespace llvm {
+ // StringRef provides an operator string; that trips up the std::pair noexcept specification,
+ // which (a) enables the moves constructor (because conversion is allowed), but (b)
+ // misclassifies the the construction as nothrow.
++// libc++ correctly handles this conversion and forbids trait specialization.
++#if !defined(_LIBCPP_VERSION)
+ namespace std {
+   template<>
+   struct is_nothrow_constructible <std::string, llvm::StringRef>
+@@ -586,6 +588,7 @@ namespace std {
+     : std::false_type {
+   };
+ }
++#endif
+ // HLSL Change Ends
+ 
+ #endif

@@ -83,12 +83,12 @@ class AudioSystem {
   xe::global_critical_region global_critical_region_;
   static constexpr size_t kMaximumClientCount = 8;
   struct {
-    AudioDriver* driver;
-    uint64_t next_pump_us;
-    uint32_t callback;
-    uint32_t callback_arg;
-    uint32_t wrapped_callback_arg;
-    bool in_use;
+    AudioDriver* driver = nullptr;
+    uint64_t next_pump_us = 0;
+    uint32_t callback = 0;
+    uint32_t callback_arg = 0;
+    uint32_t wrapped_callback_arg = 0;
+    bool in_use = false;
     std::mutex lock;
   } clients_[kMaximumClientCount];
 

@@ -14,6 +14,7 @@
 #include <cstring>
 
 #include "xenia/base/platform.h"
+#include "xenia/cpu/backend/code_cache.h"
 #if XE_ARCH_AMD64
 #include "xenia/cpu/backend/x64/x64_backend.h"
 #elif XE_ARCH_ARM64
@@ -123,6 +124,74 @@ TEST_CASE("GUEST_TRAMPOLINE_BASIC", "[backend]") {
 
   // Clean up the trampoline.
   processor->backend()->FreeGuestTrampoline(trampoline_addr);
+}
+
+// Exercise the indirection slot and executable trampoline, including slot reuse.
+// On Apple Silicon these host addresses are 64-bit pointers in MAP_JIT memory.
+TEST_CASE("GUEST_TRAMPOLINE_INDIRECT_EXECUTION", "[backend]") {
+  trampoline_call_count = 0;
+  TestFunction test([](HIRBuilder& b) {
+    b.CallIndirect(LoadGPR(b, 4));
+    StoreGPR(b, 5, b.LoadConstantUint64(0x12345678));
+    b.Return();
+  }, /*skip_cf_simplification=*/true);
+  auto* backend = test.processors[0]->backend();
+  for (uintptr_t i = 1; i <= 2; ++i) {
+    void* tag1 = reinterpret_cast<void*>(0x1000 + i);
+    void* tag2 = reinterpret_cast<void*>(0x2000 + i);
+    uint32_t address = backend->CreateGuestTrampoline(
+        // Allocate from the far end so the synthetic test function at
+        // 0x80000000 does not share an indirection slot with the trampoline.
+        TrampolineCallback, tag1, tag2, true);
+    test.Run(
+        [address](PPCContext* ctx) {
+          ctx->r[3] = 0;
+          ctx->r[4] = address;
+          ctx->r[5] = 0;
+        },
+        [=](PPCContext* ctx) {
+          REQUIRE(ctx->r[3] == 0xCAFEBABE);
+          REQUIRE(ctx->r[5] == 0x12345678);
+          REQUIRE(trampoline_received_arg1 == tag1);
+          REQUIRE(trampoline_received_arg2 == tag2);
+          REQUIRE(trampoline_call_count == i);
+        });
+    backend->FreeGuestTrampoline(address);
+  }
+}
+
+// Resolve a callee while already running JIT code. The resolver compiles under
+// write protection, restores execute permission, then tail-calls the new code.
+TEST_CASE("GUEST_INDIRECT_LAZY_RESOLUTION", "[backend]") {
+  TestFunction test([](HIRBuilder& b) {
+    b.CallIndirect(LoadGPR(b, 4));
+    StoreGPR(b, 5, b.LoadConstantUint64(0x87654321));
+    b.Return();
+  }, /*skip_cf_simplification=*/true);
+  auto* processor = test.processors[0].get();
+  auto callee = std::make_unique<TestModule>(
+      processor, "Callee",
+      [](uint32_t address) { return address == 0x80010000; },
+      [](HIRBuilder& b) {
+        StoreGPR(b, 3, b.LoadConstantUint64(0xABCDEF12));
+        b.Return();
+        return true;
+      });
+  processor->AddModule(std::move(callee));
+  processor->backend()->CommitExecutableRange(0x80010000, 0x80020000);
+  // First call compiles the callee, second uses its published indirection slot.
+  for (int i = 0; i < 2; ++i) {
+    test.Run(
+        [](PPCContext* ctx) {
+          ctx->r[3] = 0;
+          ctx->r[4] = 0x80010000;
+          ctx->r[5] = 0;
+        },
+        [](PPCContext* ctx) {
+          REQUIRE(ctx->r[3] == 0xABCDEF12);
+          REQUIRE(ctx->r[5] == 0x87654321);
+        });
+  }
 }
 
 // =============================================================================
@@ -823,10 +892,31 @@ TEST_CASE("FPCR_PRESERVED_ACROSS_HOST_CALLBACK", "[backend]") {
 
 #if !XE_PLATFORM_WIN32
 #include <execinfo.h>
+#if XE_PLATFORM_APPLE
+#include <unwind.h>
+static uintptr_t jit_backtrace_base = 0;
+static size_t jit_backtrace_size = 0;
+static size_t jit_backtrace_frames = 0;
+static _Unwind_Reason_Code CaptureUnwindFrame(_Unwind_Context* context,
+                                             void* data) {
+  ++*static_cast<int*>(data);
+  uintptr_t pc = _Unwind_GetIP(context);
+  if (pc >= jit_backtrace_base && pc < jit_backtrace_base + jit_backtrace_size) {
+    ++jit_backtrace_frames;
+  }
+  return _URC_NO_REASON;
+}
+#endif
 static int jit_backtrace_depth = 0;
 static void CaptureJITBacktrace(ppc::PPCContext* ctx, void* arg0, void* arg1) {
+#if XE_PLATFORM_APPLE
+  // Darwin backtrace() may follow only frame pointers and silently skip JIT
+  // frames. Use the unwinder and count actual PCs in registered JIT storage.
+  _Unwind_Backtrace(CaptureUnwindFrame, &jit_backtrace_depth);
+#else
   void* frames[64];
   jit_backtrace_depth = backtrace(frames, 64);
+#endif
 }
 #endif
 
@@ -877,6 +967,11 @@ TEST_CASE("JIT_UNWIND_INFO_REGISTERED", "[backend]") {
   //   callback -> GuestToHostThunk -> guest func -> HostToGuestThunk -> Call
   // giving at least 4 frames. Without unwind info it stops at 1-2.
   jit_backtrace_depth = 0;
+#if XE_PLATFORM_APPLE
+  jit_backtrace_frames = 0;
+  jit_backtrace_base = processor->backend()->code_cache()->execute_base_address();
+  jit_backtrace_size = processor->backend()->code_cache()->total_size();
+#endif
 
   auto* builtin_fn = processor->DefineBuiltin(
       "CaptureJITBacktrace", CaptureJITBacktrace, nullptr, nullptr);
@@ -906,6 +1001,9 @@ TEST_CASE("JIT_UNWIND_INFO_REGISTERED", "[backend]") {
   fn->Call(thread_state.get(), uint32_t(ctx->lr));
 
   REQUIRE(jit_backtrace_depth >= 4);
+#if XE_PLATFORM_APPLE
+  REQUIRE(jit_backtrace_frames >= 3);
+#endif
 
   memory->SystemHeapFree(stack_address);
 #endif

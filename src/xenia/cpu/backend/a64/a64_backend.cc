@@ -80,7 +80,7 @@ A64HelperEmitter::A64HelperEmitter(A64Backend* backend,
 //   x2 = return address value (arg1)
 //
 // ARM64 AAPCS64 calling convention:
-//   Caller-saved: x0-x18, v0-v7, v16-v31
+//   Caller-saved: x0-x17 (x18 is reserved by Darwin), v0-v7, v16-v31
 //   Callee-saved: x19-x28, x29(FP), x30(LR), d8-d15
 //
 // We save all callee-saved regs, set up context (x20) and membase (x21),
@@ -176,6 +176,7 @@ HostToGuestThunk A64HelperEmitter::EmitHostToGuestThunk() {
       code_offsets.prolog_stack_alloc - code_offsets.prolog;
   func_info.stack_size = thunk_stack;
   func_info.lr_save_offset = 0x058;  // stp x29, x30, [sp, #0x50]
+  func_info.saves_host_registers = true;
 
   void* fn = Emplace(func_info);
   return reinterpret_cast<HostToGuestThunk>(fn);
@@ -556,6 +557,7 @@ static void BuildGuestTrampoline(uint8_t* buf, void* proc, void* userdata1,
 A64Backend::A64Backend() {
   code_cache_ = A64CodeCache::Create();
 
+#if !XE_PLATFORM_APPLE
   // Allocate executable memory for guest trampolines.
   uint32_t base_address = 0x10000;
   void* buf = nullptr;
@@ -573,17 +575,20 @@ A64Backend::A64Backend() {
   }
   xenia_assert(buf);
   guest_trampoline_memory_ = reinterpret_cast<uint8_t*>(buf);
+#endif
   guest_trampoline_address_bitmap_.Resize(MAX_GUEST_TRAMPOLINES);
 }
 
 A64Backend::~A64Backend() {
   ExceptionHandler::Uninstall(&ExceptionCallbackThunk, this);
+#if !XE_PLATFORM_APPLE
   if (guest_trampoline_memory_) {
     memory::DeallocFixed(guest_trampoline_memory_,
                          kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES,
                          memory::DeallocationType::kRelease);
     guest_trampoline_memory_ = nullptr;
   }
+#endif
 }
 
 bool A64Backend::Initialize(Processor* processor) {
@@ -596,6 +601,11 @@ bool A64Backend::Initialize(Processor* processor) {
     XELOGE("A64Backend: Failed to initialize code cache");
     return false;
   }
+
+#if XE_PLATFORM_APPLE
+  guest_trampoline_memory_ = static_cast<uint8_t*>(code_cache_->AllocateCodeStorage(
+      kGuestTrampolineSize * MAX_GUEST_TRAMPOLINES));
+#endif
 
   // Expose the code cache to the base Backend class.
   Backend::code_cache_ = code_cache_.get();
@@ -637,7 +647,7 @@ bool A64Backend::Initialize(Processor* processor) {
 
   // Set the indirection table default to point at the resolve thunk.
   code_cache_->set_indirection_default(
-      uint32_t(reinterpret_cast<uint64_t>(resolve_function_thunk_)));
+      reinterpret_cast<uintptr_t>(resolve_function_thunk_));
 
   // Commit the indirection table range used by guest trampolines so that
   // CreateGuestTrampoline can call AddIndirection without faulting.
@@ -677,11 +687,13 @@ uint64_t A64Backend::CalculateNextHostInstruction(ThreadDebugInfo* thread_info,
 static constexpr uint32_t kArm64Brk0 = 0xD4200000;
 
 void A64Backend::InstallBreakpoint(Breakpoint* breakpoint) {
-  breakpoint->ForEachHostAddress([breakpoint](uint64_t host_address) {
+  JitWriteScope write_scope;
+  breakpoint->ForEachHostAddress([this, breakpoint](uint64_t host_address) {
     auto ptr = reinterpret_cast<void*>(host_address);
     auto original_bytes = xe::load<uint32_t>(ptr);
     assert_true(original_bytes != kArm64Brk0);
     xe::store<uint32_t>(ptr, kArm64Brk0);
+    code_cache_->FlushCodeRange(ptr, sizeof(uint32_t));
     breakpoint->backend_data().emplace_back(host_address, original_bytes);
   });
 }
@@ -697,19 +709,23 @@ void A64Backend::InstallBreakpoint(Breakpoint* breakpoint, Function* fn) {
     return;
   }
 
+  JitWriteScope write_scope;
   auto ptr = reinterpret_cast<void*>(host_address);
   auto original_bytes = xe::load<uint32_t>(ptr);
   assert_true(original_bytes != kArm64Brk0);
   xe::store<uint32_t>(ptr, kArm64Brk0);
+  code_cache_->FlushCodeRange(ptr, sizeof(uint32_t));
   breakpoint->backend_data().emplace_back(host_address, original_bytes);
 }
 
 void A64Backend::UninstallBreakpoint(Breakpoint* breakpoint) {
+  JitWriteScope write_scope;
   for (auto& pair : breakpoint->backend_data()) {
     auto ptr = reinterpret_cast<uint8_t*>(pair.first);
     auto instruction_bytes = xe::load<uint32_t>(ptr);
     assert_true(instruction_bytes == kArm64Brk0);
     xe::store<uint32_t>(ptr, static_cast<uint32_t>(pair.second));
+    code_cache_->FlushCodeRange(ptr, sizeof(uint32_t));
   }
   breakpoint->backend_data().clear();
 }
@@ -764,18 +780,13 @@ uint32_t A64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,
   uint8_t* write_pos =
       &guest_trampoline_memory_[kGuestTrampolineSize * new_index];
 
-  BuildGuestTrampoline(write_pos, reinterpret_cast<void*>(proc), userdata1,
-                       userdata2,
-                       reinterpret_cast<void*>(guest_to_host_thunk_));
-
-  // Flush instruction cache for the new trampoline code.
-#if XE_PLATFORM_WIN32
-  FlushInstructionCache(GetCurrentProcess(), write_pos, kGuestTrampolineSize);
-#else
-  __builtin___clear_cache(
-      reinterpret_cast<char*>(write_pos),
-      reinterpret_cast<char*>(write_pos + kGuestTrampolineSize));
-#endif
+  {
+    JitWriteScope write_scope;
+    BuildGuestTrampoline(write_pos, reinterpret_cast<void*>(proc), userdata1,
+                         userdata2,
+                         reinterpret_cast<void*>(guest_to_host_thunk_));
+    code_cache_->FlushCodeRange(write_pos, kGuestTrampolineSize);
+  }
 
   uint32_t indirection_guest_addr =
       GUEST_TRAMPOLINE_BASE +
@@ -783,7 +794,7 @@ uint32_t A64Backend::CreateGuestTrampoline(GuestTrampolineProc proc,
 
   code_cache()->AddIndirection(
       indirection_guest_addr,
-      static_cast<uint32_t>(reinterpret_cast<uintptr_t>(write_pos)));
+      reinterpret_cast<uintptr_t>(write_pos));
 
   return indirection_guest_addr;
 }

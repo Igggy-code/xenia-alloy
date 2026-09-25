@@ -14,6 +14,7 @@
 #include <mutex>
 #include <string>
 
+#include "xenia/base/memory.h"
 #include "xenia/base/mutex.h"
 #include "xenia/base/vec128.h"
 #include "xenia/guest_pointers.h"
@@ -439,6 +440,15 @@ typedef struct alignas(64) PPCContext_s {
         static_cast<uint32_t>(reinterpret_cast<uintptr_t>(this))) {
       host_address += 0x1000;
     }
+#else
+    // Hosts with an allocation granularity above 4 KB (16 KB pages on Apple
+    // Silicon) can't map the 0xE0000000 physical view at the +4 KB file
+    // offset, so the offset is applied here, matching the JIT and the
+    // vE0000000 heap's host_address_offset.
+    if (xe::memory::allocation_granularity() > 0x1000 &&
+        guest_address >= 0xE0000000u) {
+      host_address += 0x1000;
+    }
 #endif
     return reinterpret_cast<T>(host_address);
   }
@@ -465,6 +475,11 @@ typedef struct alignas(64) PPCContext_s {
         reinterpret_cast<const uint8_t*>(host_ptr) - virtual_membase);
 #if XE_PLATFORM_WIN32 == 1
     if (guest_tmp >= static_cast<uint32_t>(reinterpret_cast<uintptr_t>(this))) {
+      guest_tmp -= 0x1000;
+    }
+#else
+    if (xe::memory::allocation_granularity() > 0x1000 &&
+        guest_tmp >= 0xE0001000u) {
       guest_tmp -= 0x1000;
     }
 #endif

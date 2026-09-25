@@ -48,6 +48,9 @@
 
 // Available graphics systems:
 #include "xenia/gpu/null/null_graphics_system.h"
+#if XE_PLATFORM_MAC
+#include "xenia/gpu/metal/metal_graphics_system.h"
+#endif
 #if !XE_PLATFORM_MAC
 #include "xenia/gpu/vulkan/vulkan_graphics_system.h"
 #endif
@@ -72,6 +75,10 @@
 #define APU_OPTIONS "[any, nop, sdl, xaudio2]"
 #define GPU_OPTIONS "[any, d3d12, vulkan, null]"
 #define HID_OPTIONS "[any, nop, sdl, keyboard, xinput]"
+#elif XE_PLATFORM_MAC
+#define APU_OPTIONS "[any, nop, sdl]"
+#define GPU_OPTIONS "[any, metal, null]"
+#define HID_OPTIONS "[any, nop, sdl]"
 #elif XE_PLATFORM_LINUX
 #define APU_OPTIONS "[any, alsa, nop, sdl]"
 #define GPU_OPTIONS "[any, vulkan, null]"
@@ -408,6 +415,9 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
     return std::make_unique<gpu::null::NullGraphicsSystem>();
   }
   Factory<gpu::GraphicsSystem> factory;
+#if XE_PLATFORM_MAC
+  factory.Add<gpu::metal::MetalGraphicsSystem>("metal");
+#endif
 #if XE_PLATFORM_WIN32
   factory.Add<gpu::d3d12::D3D12GraphicsSystem>("d3d12");
 #endif  // XE_PLATFORM_WIN32
@@ -420,7 +430,9 @@ std::unique_ptr<gpu::GraphicsSystem> EmulatorApp::CreateGraphicsSystem() {
     xe::FatalError(
         "Unable to initialize the graphics subsystem.\n"
         "\n"
-#if XE_PLATFORM_ANDROID
+#if XE_PLATFORM_MAC
+        "A Metal-compatible GPU and macOS 15 or newer are required."
+#elif XE_PLATFORM_ANDROID
         "The GPU must support at least Vulkan 1.0 with the 'independentBlend' "
         "feature.\n"
         "\n"

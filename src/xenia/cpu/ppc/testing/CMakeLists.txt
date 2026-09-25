@@ -13,6 +13,9 @@ target_compile_definitions(xenia-cpu-ppc-tests PRIVATE
 if(WIN32)
   target_sources(xenia-cpu-ppc-tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_win.cc)
+elseif(APPLE)
+  target_sources(xenia-cpu-ppc-tests PRIVATE
+    ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_mac.cc)
 else()
   target_sources(xenia-cpu-ppc-tests PRIVATE
     ${PROJECT_SOURCE_DIR}/src/xenia/base/console_app_main_posix.cc)
@@ -40,4 +43,11 @@ elseif(XE_TARGET_AARCH64)
 endif()
 
 xe_target_defaults(xenia-cpu-ppc-tests)
+if(APPLE)
+  add_custom_command(TARGET xenia-cpu-ppc-tests POST_BUILD
+    COMMAND /usr/bin/codesign --force --sign -
+      --entitlements "${PROJECT_SOURCE_DIR}/xenia.entitlements"
+      "$<TARGET_FILE:xenia-cpu-ppc-tests>"
+    VERBATIM)
+endif()
 add_test(NAME xenia-cpu-ppc-tests COMMAND xenia-cpu-ppc-tests)

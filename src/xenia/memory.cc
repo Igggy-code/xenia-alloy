@@ -9,7 +9,11 @@
 
 #include "xenia/memory.h"
 
+#include <cerrno>
 #include <cstring>
+#if XE_PLATFORM_APPLE
+#include <sys/mman.h>
+#endif
 #include <random>
 
 #include "third_party/fmt/include/fmt/format.h"
@@ -115,6 +119,39 @@ static inline bool ShouldSkipHostCommit(const BaseHeap& heap) {
   return false;
 }
 
+// With the host commit skipped (host pages larger than 4 KB), the host
+// protection left by an earlier BaseHeap::Protect - such as thread stack guard
+// pages set to no access - would persist when the range is reused by a new
+// allocation, and accessing the new allocation would crash (4D5309C9 after
+// pressing Start), or read-only XEX sections of an unloaded module when the
+// module is loaded again (4D5309C9 XMediaFacade_default.xex after the second
+// race). Reapply the requested protection like a host commit would.
+static void ReapplyHostProtectionForSkippedCommit(void* host_address,
+                                                  size_t size,
+                                                  uint32_t protect) {
+  if (!host_address || !size) {
+    return;
+  }
+  uintptr_t host_page_size = uintptr_t(xe::memory::page_size());
+  uintptr_t start = reinterpret_cast<uintptr_t>(host_address);
+  uintptr_t end = start + size;
+  uintptr_t aligned_start = start & ~(host_page_size - 1);
+  uintptr_t aligned_end = (end + host_page_size - 1) & ~(host_page_size - 1);
+  xe::memory::PageAccess access;
+  if (aligned_start == start && aligned_end == end) {
+    access = ToPageAccess(protect);
+  } else {
+    // The host pages are shared with neighboring guest pages - never make
+    // them less accessible than read/write.
+    if (!(protect & (kMemoryProtectRead | kMemoryProtectWrite))) {
+      return;
+    }
+    access = xe::memory::PageAccess::kReadWrite;
+  }
+  xe::memory::Protect(reinterpret_cast<void*>(aligned_start),
+                      aligned_end - aligned_start, access, nullptr);
+}
+
 void RandomizeMemory(void* range_start, uint32_t size) {
   if (!cvars::scribble_heap) {
     return;
@@ -179,16 +216,25 @@ bool Memory::Initialize() {
 
   // Create main page file-backed mapping. This is all reserved but
   // uncommitted (so it shouldn't expand page file).
+  // Include alignment slack for the physical 4 KB alias on 4 KB hosts.
+  const size_t mapping_size = xe::round_up(
+      0x120000000ull + system_allocation_granularity_,
+      system_allocation_granularity_);
   mapping_ = xe::memory::CreateFileMappingHandle(
-      file_name_,
-      // entire 4gb space + 512mb physical:
-      0x11FFFFFFF, xe::memory::PageAccess::kReadWrite, false);
+      file_name_, mapping_size, xe::memory::PageAccess::kReadWrite, false);
   if (mapping_ == xe::memory::kFileMappingHandleInvalid) {
     XELOGE("Unable to reserve the 4gb guest address space.");
     assert_always();
     return false;
   }
 
+#if XE_PLATFORM_APPLE
+  if (MapViewsMac()) {
+    XELOGE("Unable to reserve and map the contiguous guest address space.");
+    return false;
+  }
+  mapping_base_ = views_.all_views[0];
+#else
   // Attempt to create our views. This may fail at the first address
   // we pick, so try a few times.
   mapping_base_ = 0;
@@ -204,6 +250,7 @@ bool Memory::Initialize() {
     assert_always();
     return false;
   }
+#endif
   virtual_membase_ = mapping_base_;
   physical_membase_ = mapping_base_ + 0x100000000ull;
 
@@ -358,6 +405,53 @@ static const struct {
         0x0000000100000000ull,
     },
 };
+#if XE_PLATFORM_APPLE
+int Memory::MapViewsMac() {
+  assert_true(xe::countof(map_info) == xe::countof(views_.all_views));
+
+  // macOS does not guarantee that a non-MAP_FIXED mmap will honor the requested
+  // address. Reserve a contiguous address range first, then MAP_FIXED each view
+  // within that reserved range to keep the guest layout identical to Windows.
+  const size_t total_size =
+      map_info[xe::countof(map_info) - 1].virtual_address_end -
+      map_info[0].virtual_address_start + 1;
+
+  void* reserved_base =
+      mmap(nullptr, total_size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (reserved_base == MAP_FAILED) {
+    XELOGE("MapViewsMac: reserve failed: {}", std::strerror(errno));
+    return 1;
+  }
+
+  uint8_t* mapping_base = reinterpret_cast<uint8_t*>(reserved_base);
+  uint64_t granularity_mask = ~uint64_t(system_allocation_granularity_ - 1);
+
+  for (size_t n = 0; n < xe::countof(map_info); n++) {
+    size_t view_size =
+        map_info[n].virtual_address_end - map_info[n].virtual_address_start + 1;
+    size_t file_offset = map_info[n].target_address & granularity_mask;
+    void* target_address = mapping_base + map_info[n].virtual_address_start;
+    void* result = mmap(target_address, view_size, PROT_READ | PROT_WRITE,
+                        MAP_SHARED | MAP_FIXED, mapping_, file_offset);
+    if (result == MAP_FAILED || result != target_address) {
+      int err = errno;
+      XELOGE(
+          "MapViewsMac: map failed view {} addr 0x{:016X} size 0x{:X} "
+          "offset 0x{:X} err {} ({})",
+          n, reinterpret_cast<uintptr_t>(target_address), view_size,
+          file_offset, err, std::strerror(err));
+      munmap(reserved_base, total_size);
+      for (auto& view : views_.all_views) {
+        view = nullptr;
+      }
+      return 1;
+    }
+    views_.all_views[n] = reinterpret_cast<uint8_t*>(result);
+  }
+
+  return 0;
+}
+#endif  // XE_PLATFORM_APPLE
 int Memory::MapViews(uint8_t* mapping_base) {
   assert_true(xe::countof(map_info) == xe::countof(views_.all_views));
   // 0xE0000000 4 KB offset is emulated via host_address_offset and on the CPU
@@ -384,6 +478,7 @@ void Memory::UnmapViews() {
       size_t length = map_info[n].virtual_address_end -
                       map_info[n].virtual_address_start + 1;
       xe::memory::UnmapFileView(mapping_, views_.all_views[n], length);
+      views_.all_views[n] = nullptr;
     }
   }
 }
@@ -1087,6 +1182,10 @@ bool BaseHeap::Alloc(uint32_t size, uint32_t alignment,
 bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
                           uint32_t alignment, uint32_t allocation_type,
                           uint32_t protect) {
+  if (heap_type_ == HeapType::kGuestXex) {
+    XELOGD("XexHeap: AllocFixed {:08X} size {:X} type {:X} protect {:X}",
+           base_address, size, allocation_type, protect);
+  }
   alignment = xe::round_up(alignment, page_size_);
   size = xe::align(size, alignment);
   assert_true((base_address + host_address_offset_) % alignment == 0);
@@ -1144,9 +1243,18 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size,
       if (cvars::scribble_heap && protect & kMemoryProtectWrite) {
         RandomizeMemory(result, page_count * page_size_);
       }
-    } else if (cvars::scribble_heap && protect & kMemoryProtectWrite) {
-      RandomizeMemory(TranslateRelative(start_page_number * page_size_),
-                      page_count * page_size_);
+    } else {
+      if ((allocation_type & kMemoryAllocationCommit) &&
+          (heap_type_ == HeapType::kGuestVirtual ||
+           heap_type_ == HeapType::kGuestXex)) {
+        ReapplyHostProtectionForSkippedCommit(
+            TranslateRelative(start_page_number * page_size_),
+            size_t(page_count) * page_size_, protect);
+      }
+      if (cvars::scribble_heap && protect & kMemoryProtectWrite) {
+        RandomizeMemory(TranslateRelative(start_page_number * page_size_),
+                        page_count * page_size_);
+      }
     }
   }
 
@@ -1340,9 +1448,19 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address,
       if (cvars::scribble_heap && (protect & kMemoryProtectWrite)) {
         RandomizeMemory(result, page_count << page_size_shift_);
       }
-    } else if (cvars::scribble_heap && (protect & kMemoryProtectWrite)) {
-      RandomizeMemory(TranslateRelative(start_page_number << page_size_shift_),
-                      page_count << page_size_shift_);
+    } else {
+      if ((allocation_type & kMemoryAllocationCommit) &&
+          (heap_type_ == HeapType::kGuestVirtual ||
+           heap_type_ == HeapType::kGuestXex)) {
+        ReapplyHostProtectionForSkippedCommit(
+            TranslateRelative(start_page_number << page_size_shift_),
+            size_t(page_count) << page_size_shift_, protect);
+      }
+      if (cvars::scribble_heap && (protect & kMemoryProtectWrite)) {
+        RandomizeMemory(
+            TranslateRelative(start_page_number << page_size_shift_),
+            page_count << page_size_shift_);
+      }
     }
   }
 
@@ -1381,6 +1499,9 @@ bool BaseHeap::AllocSystemHeap(uint32_t size, uint32_t alignment,
 }
 
 bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
+  if (heap_type_ == HeapType::kGuestXex) {
+    XELOGD("XexHeap: Decommit {:08X} size {:X}", address, size);
+  }
   uint32_t page_count = get_page_count(size, page_size_);
   uint32_t start_page_number = (address - heap_base_) / page_size_;
   uint32_t end_page_number = start_page_number + page_count - 1;
@@ -1412,6 +1533,9 @@ bool BaseHeap::Decommit(uint32_t address, uint32_t size) {
 }
 
 bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
+  if (heap_type_ == HeapType::kGuestXex) {
+    XELOGD("XexHeap: Release {:08X}", base_address);
+  }
   auto global_lock = global_critical_region_.Acquire();
 
   // Given address must be a region base address.
@@ -1475,6 +1599,10 @@ bool BaseHeap::Release(uint32_t base_address, uint32_t* out_region_size) {
 
 bool BaseHeap::Protect(uint32_t address, uint32_t size, uint32_t protect,
                        uint32_t* old_protect) {
+  if (heap_type_ == HeapType::kGuestXex) {
+    XELOGD("XexHeap: Protect {:08X} size {:X} protect {:X}", address, size,
+           protect);
+  }
   if (!size) {
     XELOGE("BaseHeap::Protect failed due to zero size");
     return false;

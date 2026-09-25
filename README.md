@@ -1,75 +1,127 @@
 <p align="center">
-    <a href="https://github.com/xenia-canary/xenia-canary/tree/canary_experimental/assets/icon">
-        <img height="256px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
-    </a>
+    <img height="192px" src="https://raw.githubusercontent.com/xenia-canary/xenia/master/assets/icon/256.png" />
 </p>
 
-<h1 align="center">Xenia Canary - Xbox 360 Emulator</h1>
+<h1 align="center">Xenia Canary for macOS — native Metal build</h1>
 
-Xenia Canary is an experimental fork of the Xenia emulator. For more information, see the
-[Xenia Canary wiki](https://github.com/xenia-canary/xenia-canary/wiki).
+<p align="center">
+An unofficial fork of <a href="https://github.com/xenia-canary/xenia-canary">Xenia Canary</a>
+that runs natively on Apple Silicon Macs, with an ARM64 JIT and a Metal GPU backend.<br>
+No CrossOver, no Rosetta, no Wine.
+</p>
 
-Come chat with us about **emulator-related topics** on [Discord](https://discord.gg/Q9mxZf9).
-For developer chat join `#dev` but stay on topic. Lurking is not only fine, but encouraged!
-Please check the [FAQ](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page before asking questions.
-We've got jobs/lives/etc, so don't expect instant answers.
+> **This is not an official Xenia project.** It is not affiliated with or endorsed by the
+> Xenia or Xenia Canary teams. Please **do not report issues from this fork to the Xenia
+> developers** — open them here instead.
 
-Discussing illegal activities will get you banned.
+## How it started
 
-## Status
+It began with a simple wish: to play **Fable II** on a Mac. The Metal backend from
+[wmarti's Xenia macOS port](https://github.com/wmarti/xenia-mac) (Xenia Edge macOS v0.2.1)
+showed that Xenia on Metal was possible, but it was built on an older emulator core.
+This fork moves that backend onto the current Xenia Canary core, uses Canary's ARM64 JIT,
+and fixes the remaining CPU, memory, and GPU problems until real games became
+playable — first Fable II, then Forza Horizon.
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Canary (🪟, 🐧) | [![CI](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental)](https://github.com/xenia-canary/xenia-canary/actions/workflows/Orchestrator.yml/badge.svg?branch=canary_experimental) [![Codacy Badge](https://app.codacy.com/project/badge/Grade/cd506034fd8148309a45034925648499)](https://app.codacy.com/gh/xenia-canary/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/xenia-canary/xenia-canary/releases/latest) ◦ [All](https://github.com/xenia-canary/xenia-canary/releases) ◦ [Old](https://github.com/xenia-canary/xenia-canary-releases/releases)
+## Game status
 
-### Experimental Netplay
+Tested on an Apple M4 with macOS 27. Anything not listed here is untested — reports are welcome.
 
-Buildbot | Status | Releases
--------- | ------ | --------
-Windows | [![Codacy Badge](https://app.codacy.com/project/badge/Grade/d814c4b6aa444dcc9c1631e0224b2739)](https://app.codacy.com/gh/AdrianCassar/xenia-canary/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade) | [Latest](https://github.com/AdrianCassar/xenia-canary/releases/latest)
+| Game | Title ID | Status | Notes |
+| --- | --- | --- | --- |
+| Fable II | 4D5307F1 | **Playable** | ~20–28 FPS. Hero, dog and clothing textures correct. `metal_force_linear_filter = true` recommended. |
+| Forza Horizon | 4D5309C9 | **Playable** | Races complete, ~20–29 FPS. Short stutters while new shaders compile. A crash after returning to the menu several times is under investigation. |
 
-## Quickstart
+## What is in this build
 
-See the [Quickstart](https://github.com/xenia-canary/xenia-canary/wiki/Quickstart) page.
+**Platform (macOS / Apple Silicon)**
+- Native ARM64 application bundle with the Canary ARM64 JIT (W^X via `MAP_JIT`,
+  correct handling of large guest functions).
+- Guest memory mapped into one contiguous reservation, with support for 16 KB host
+  pages. Guest page protection is reapplied when memory is reused without a host
+  commit, which fixes crashes in games that reload modules (Forza Horizon).
+- macOS exception handling for MMIO and write watches (`SA_NODEFER`, correct
+  register-state write-back), which fixes audio (XMA) hangs and "Disc Read Error" loops.
+- Cocoa windowing, file picker, and application packaging. Logs go to
+  `~/.local/share/Xenia/logs` rather than into the signed app bundle.
 
-## FAQ
+**Metal GPU backend**
+- Guest shaders are translated DXBC → DXIL → Metal with Apple's Metal Shader Converter.
+  An experimental SPIR-V → SPIRV-Cross → MSL path is available
+  (`metal_use_spirvcross`, needed for future iOS work).
+- Utility shaders are compiled from Canary's XeSL sources for MSL. Fixes include
+  `first_one_bit_high` and the EDRAM MSAA sample layout.
+- Pipeline binary archive (a disk cache) plus multithreaded shader and pipeline compilation.
+- Tessellation and geometry emulation, with a depth-bias workaround for tessellated
+  depth-only passes (`metal_tessellated_depth_only_bias`).
+- Alpha to coverage is emulated in the pixel shader like on D3D12 and Vulkan, not
+  applied by the hardware a second time.
+- **GPU → CPU synchronization for games that read GPU results back.** Some games (for
+  example Fable II, which generates character textures on the GPU and reads them back)
+  need the CPU to wait for the GPU before a fence becomes visible. The following options
+  control this:
+  - `metal_sync_gpu_writes_for_guest`: enable for all games.
+  - `metal_sync_gpu_writes_for_guest_titles`: list of title IDs to enable it for. The
+    default is Fable II only, so other games are not slowed down.
+  - `metal_sync_gpu_writes_skip_after_frames`: skip the wait for targets that are
+    re-rendered every frame (GPU-only data). Default 90; 0 always waits.
 
-See the [frequently asked questions](https://github.com/xenia-canary/xenia-canary/wiki/FAQ) page.
-
-## Game Compatibility
-
-See the [Game compatibility list](https://github.com/xenia-canary/game-compatibility/issues)
-for currently tracked games, and feel free to contribute your own updates,
-screenshots, and information there following the [existing conventions](https://github.com/xenia-canary/game-compatibility/blob/canary/README.md).
+Windows and Linux code paths from upstream are kept, and the project still builds with
+the standard Canary CMake setup on those platforms (not tested by this fork).
 
 ## Building
 
-See [building.md](docs/building.md) for setup and information about the
-`xb` script. When writing code, check the [style guide](docs/style_guide.md)
-and be sure to run clang-format!
+Requirements: Apple Silicon Mac, macOS 15 or newer, Apple Command Line Tools (full
+Xcode is not needed), CMake 3.20+, Ninja, Python 3.9+.
 
-## Contributors Wanted!
+```sh
+git clone --recursive <this repository>
+cd <repository folder>
+./tools/build_macos.sh          # fetches pinned dependencies, builds, bundles and signs
+python3 tools/test_macos.py     # optional: base, CPU and Metal tests
+open build-macos-arm64/bin/macOS/xenia_canary.app
+```
 
-Have some spare time, know advanced C++, and want to write an emulator?
-Contribute! There's a ton of work that needs to be done, a lot of which
-is wide open greenfield fun.
+Use `JOBS=2 ./tools/build_macos.sh` to reduce the load while building. The build
+produces an ad-hoc signed app. Pinned dependency versions are listed in
+[docs/macos-source-lock.json](docs/macos-source-lock.json).
 
-**For general rules and guidelines please see [CONTRIBUTING.md](.github/CONTRIBUTING.md).**
+You need your own legally obtained game dumps. Open them with **File → Open**. Settings
+and saves are stored in `~/.local/share/Xenia` (change this with `--storage_root=...`).
 
-Fixes and optimizations are always welcome (please!), but in addition to
-that there are some major work areas still untouched:
+## Debugging and diagnostics
 
-* Help work through [missing functionality/bugs in games](https://github.com/xenia-canary/xenia-canary/labels/compat)
-* Reduce the size of Xenia's [huge log files](https://github.com/xenia-canary/xenia-canary/issues/1526)
-* Skilled with Linux? A strong contributor is needed to [help with porting](https://github.com/xenia-canary/xenia-canary/labels/platform-linux)
+- `--metal_perf_log=true`: once per second, logs FPS, the slowest frame, draw calls,
+  GPU wait time, and time spent compiling pipelines and shaders. Useful for finding
+  stutter sources.
+- `--log_level=3`: verbose logging, including guest XEX heap operations.
+- `--a64_function_map_path=<file>`: writes the host address range and source map of
+  every JIT-compiled guest function. This lets you map host addresses from macOS
+  `sample` / Instruments profiles back to guest (PowerPC) code:
+  `sample xenia_canary 10 -file profile.txt`.
+- `--metal_sync_gpu_writes_for_guest=true`: try this if a game shows missing or corrupted
+  textures that the game generates at runtime.
+- `python3 tools/test_macos.py --metal-only`: checks Metal shader compilation and
+  GPU compute on your machine.
 
-See more projects [good for contributors](https://github.com/xenia-canary/xenia-canary/labels/good%20first%20issue). It's a good idea to ask on Discord and check the issues page before beginning work on
-something.
+## Credits
 
-## Disclaimer
+- **The Xenia team**: Ben Vanik and all contributors to the original
+  [Xenia](https://github.com/xenia-project/xenia) emulator.
+- **The Xenia Canary team and contributors**: the emulator core, ARM64 JIT and
+  everything this fork is built on.
+- **wmarti**: the [Xenia macOS port](https://github.com/wmarti/xenia-mac) (Xenia Edge
+  macOS), whose Metal backend, metal-cpp and Metal Shader Converter integration are the
+  foundation of the GPU side here.
+- Apple's [metal-cpp](https://developer.apple.com/metal/cpp/) and Metal Shader
+  Converter, Microsoft's DirectX Shader Compiler, and Khronos's SPIRV-Cross.
 
-The goal of this project is to experiment, research, and educate on the topic
-of emulation of modern devices and operating systems. **It is not for enabling
-illegal activity**. All information is obtained via reverse engineering of
-legally purchased devices and games and information made public on the internet
-(you'd be surprised what's indexed on Google...).
+Most of the porting and debugging work in this fork was done together with **Claude**
+(Anthropic's large language model, Opus 5.5), which wrote and reviewed much of the code.
+Every change was tested by hand on real games.
+
+## License
+
+Xenia is licensed under the BSD license — see [LICENSE](LICENSE). This fork keeps that
+license and all original copyright notices. Third-party components keep their own
+licenses. Discussing or sharing pirated games is not allowed.

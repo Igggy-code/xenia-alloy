@@ -29,6 +29,10 @@
 #include "xenia/base/memory.h"
 #include "xenia/base/mutex.h"
 #include "xenia/cpu/backend/code_cache.h"
+#include "xenia/cpu/backend/jit_write_scope.h"
+#if XE_PLATFORM_APPLE && XE_ARCH_ARM64
+#include <sys/mman.h>
+#endif
 #include "xenia/cpu/function.h"
 
 namespace xe {
@@ -54,6 +58,9 @@ struct EmitFunctionInfo {
   // to the struct on ARM64 Windows builds where it is unused, to avoid
   // #if clutter in the backend/emitter code that sets it.
   size_t lr_save_offset;
+  // Only the host entry thunk saves the full host register set. Guest
+  // functions and the resolver may coincidentally have the same stack size.
+  bool saves_host_registers;
 #endif
 };
 
@@ -83,7 +90,18 @@ struct EmitFunctionInfo {
 template <typename Derived>
 class CodeCacheBase : public CodeCache {
  public:
+#if XE_PLATFORM_APPLE && XE_ARCH_ARM64
+  using IndirectionEntry = uint64_t;
+#else
+  using IndirectionEntry = uint32_t;
+#endif
+
   ~CodeCacheBase() override {
+#if XE_PLATFORM_APPLE && XE_ARCH_ARM64
+    if (generated_code_execute_base_) {
+      munmap(generated_code_execute_base_, kGeneratedCodeSize);
+    }
+#endif
     if (indirection_table_base_) {
       xe::memory::DeallocFixed(indirection_table_base_, kIndirectionTableSize,
                                xe::memory::DeallocationType::kRelease);
@@ -105,37 +123,58 @@ class CodeCacheBase : public CodeCache {
 
   const std::filesystem::path& file_name() const override { return file_name_; }
   uintptr_t execute_base_address() const override {
-    return kGeneratedCodeExecuteBase;
+    return reinterpret_cast<uintptr_t>(generated_code_execute_base_);
   }
   size_t total_size() const override { return kGeneratedCodeSize; }
 
   bool has_indirection_table() { return indirection_table_base_ != nullptr; }
 
-  void set_indirection_default(uint32_t default_value) {
-    indirection_default_value_ = default_value;
+  uintptr_t indirection_table_base() const {
+    return reinterpret_cast<uintptr_t>(indirection_table_base_);
   }
 
-  void AddIndirection(uint32_t guest_address, uint32_t host_address) {
+  void set_indirection_default(uintptr_t default_value) {
+    indirection_default_value_ = static_cast<IndirectionEntry>(default_value);
+  }
+
+  void AddIndirection(uint32_t guest_address, uintptr_t host_address) {
     if (!indirection_table_base_) {
       return;
     }
-    uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
-        indirection_table_base_ + (guest_address - kIndirectionTableBase));
-    *indirection_slot = host_address;
+    assert_true(guest_address >= kIndirectionTableBase);
+    auto* entries = reinterpret_cast<IndirectionEntry*>(indirection_table_base_);
+    entries[(guest_address - kIndirectionTableBase) / 4] =
+        static_cast<IndirectionEntry>(host_address);
   }
 
   void CommitExecutableRange(uint32_t guest_low, uint32_t guest_high) {
-    if (!indirection_table_base_) {
+    if (!indirection_table_base_ || guest_low >= guest_high) {
       return;
     }
-    xe::memory::AllocFixed(
-        indirection_table_base_ + (guest_low - kIndirectionTableBase),
-        guest_high - guest_low, xe::memory::AllocationType::kCommit,
-        xe::memory::PageAccess::kReadWrite);
-    uint32_t* p = reinterpret_cast<uint32_t*>(indirection_table_base_);
-    for (uint32_t address = guest_low; address < guest_high; ++address) {
-      p[(address - kIndirectionTableBase) / 4] = indirection_default_value_;
+    auto global_lock = global_critical_region_.Acquire();
+    assert_true(guest_low >= kIndirectionTableBase);
+    size_t first = (guest_low - kIndirectionTableBase) / 4;
+    size_t end = (uint64_t(guest_high) - kIndirectionTableBase + 3) / 4;
+    auto* entries = reinterpret_cast<IndirectionEntry*>(indirection_table_base_);
+    xe::memory::AllocFixed(entries + first, (end - first) * sizeof(*entries),
+                           xe::memory::AllocationType::kCommit,
+                           xe::memory::PageAccess::kReadWrite);
+    for (size_t i = first; i < end; ++i) {
+      entries[i] = indirection_default_value_;
     }
+  }
+
+  // Reserve raw executable storage in the same mapping as compiled functions.
+  // Used for reusable trampolines: macOS permits only one MAP_JIT region.
+  void* AllocateCodeStorage(size_t size) {
+    auto global_lock = global_critical_region_.Acquire();
+    auto* address = generated_code_write_base_ + generated_code_offset_;
+    generated_code_offset_ += xe::round_up(size, 16);
+    EnsureCommitted(generated_code_offset_);
+    JitWriteScope write_scope;
+    self().FillCode(address, size);
+    self().FlushCodeRange(address, size);
+    return address;
   }
 
   void PlaceHostCode(uint32_t guest_address, void* machine_code,
@@ -185,6 +224,8 @@ class CodeCacheBase : public CodeCache {
       // Commit memory if needed.
       EnsureCommitted(high_mark);
 
+      JitWriteScope write_scope;
+
       // Copy code.
       std::memcpy(code_write_address, machine_code, func_info.code_size.total);
 
@@ -210,25 +251,18 @@ class CodeCacheBase : public CodeCache {
     self().OnCodePlaced(guest_address, function_info, code_execute_address,
                         func_info.code_size.total);
 
-    // Fix up indirection table.
-    if (guest_address && indirection_table_base_) {
-      uint32_t* indirection_slot = reinterpret_cast<uint32_t*>(
-          indirection_table_base_ + (guest_address - kIndirectionTableBase));
-      *indirection_slot =
-          uint32_t(reinterpret_cast<uint64_t>(code_execute_address));
+    // Fix up indirection table only after write protection is restored.
+    if (guest_address) {
+      AddIndirection(guest_address, reinterpret_cast<uintptr_t>(code_execute_address));
     }
   }
 
   uint32_t PlaceData(const void* data, size_t length) {
-    size_t high_mark;
-    uint8_t* data_address = nullptr;
-    {
-      auto global_lock = global_critical_region_.Acquire();
-      data_address = generated_code_write_base_ + generated_code_offset_;
-      generated_code_offset_ += xe::round_up(length, 16);
-      high_mark = generated_code_offset_;
-    }
-    EnsureCommitted(high_mark);
+    auto global_lock = global_critical_region_.Acquire();
+    auto* data_address = generated_code_write_base_ + generated_code_offset_;
+    generated_code_offset_ += xe::round_up(length, 16);
+    EnsureCommitted(generated_code_offset_);
+    JitWriteScope write_scope;
     std::memcpy(data_address, data, length);
     return uint32_t(uintptr_t(data_address));
   }
@@ -269,12 +303,13 @@ class CodeCacheBase : public CodeCache {
   }
 
  protected:
-  static constexpr size_t kIndirectionTableSize = 0x1FFFFFFF;
+  static constexpr size_t kIndirectionTableSize =
+      (0x20000000 / 4) * sizeof(IndirectionEntry);
   static constexpr uintptr_t kIndirectionTableBase = 0x80000000;
-  static constexpr size_t kGeneratedCodeSize = 0x0FFFFFFF;
+  static constexpr size_t kGeneratedCodeSize = 0x10000000;
   static constexpr uintptr_t kGeneratedCodeExecuteBase = 0xA0000000;
   static const uintptr_t kGeneratedCodeWriteBase =
-      kGeneratedCodeExecuteBase + kGeneratedCodeSize + 1;
+      kGeneratedCodeExecuteBase + kGeneratedCodeSize;
   static constexpr size_t kMaximumFunctionCount = 1000000;
 
   struct UnwindReservation {
@@ -287,7 +322,11 @@ class CodeCacheBase : public CodeCache {
 
   bool Initialize() {
     indirection_table_base_ = reinterpret_cast<uint8_t*>(xe::memory::AllocFixed(
+#if XE_PLATFORM_APPLE && XE_ARCH_ARM64
+        nullptr, kIndirectionTableSize,
+#else
         reinterpret_cast<void*>(kIndirectionTableBase), kIndirectionTableSize,
+#endif
         xe::memory::AllocationType::kReserve,
         xe::memory::PageAccess::kReadWrite));
     if (!indirection_table_base_) {
@@ -299,6 +338,20 @@ class CodeCacheBase : public CodeCache {
           kIndirectionTableBase + kIndirectionTableSize);
     }
 
+#if XE_PLATFORM_APPLE && XE_ARCH_ARM64
+    // The kernel chooses the address. MAP_JIT cannot be file-backed, fixed,
+    // or split into executable/writable aliases on Apple Silicon.
+    void* jit = mmap(nullptr, kGeneratedCodeSize,
+                     PROT_READ | PROT_WRITE | PROT_EXEC,
+                     MAP_PRIVATE | MAP_ANONYMOUS | MAP_JIT, -1, 0);
+    if (jit == MAP_FAILED) {
+      XELOGE("Unable to allocate the MAP_JIT code cache");
+      return false;
+    }
+    generated_code_execute_base_ = static_cast<uint8_t*>(jit);
+    generated_code_write_base_ = generated_code_execute_base_;
+    generated_code_commit_mark_ = kGeneratedCodeSize;
+#else
     file_name_ =
         fmt::format("xenia_code_cache_{}", Clock::QueryHostTickCount());
     mapping_ = xe::memory::CreateFileMappingHandle(
@@ -347,6 +400,8 @@ class CodeCacheBase : public CodeCache {
       }
     }
 
+#endif  // XE_PLATFORM_APPLE && XE_ARCH_ARM64
+
     generated_code_map_.reserve(kMaximumFunctionCount);
     return true;
   }
@@ -359,7 +414,7 @@ class CodeCacheBase : public CodeCache {
   xe::memory::FileMappingHandle mapping_ =
       xe::memory::kFileMappingHandleInvalid;
   xe::global_critical_region global_critical_region_;
-  uint32_t indirection_default_value_ = 0xFEEDF00D;
+  IndirectionEntry indirection_default_value_ = 0xFEEDF00D;
   uint8_t* indirection_table_base_ = nullptr;
   uint8_t* generated_code_execute_base_ = nullptr;
   uint8_t* generated_code_write_base_ = nullptr;
@@ -372,27 +427,28 @@ class CodeCacheBase : public CodeCache {
 
   void EnsureCommitted(size_t high_mark) {
     using namespace xe::literals;
-    size_t old_commit_mark, new_commit_mark;
-    do {
-      old_commit_mark = generated_code_commit_mark_;
-      if (high_mark <= old_commit_mark) {
-        break;
-      }
-      new_commit_mark = old_commit_mark + 16_MiB;
-      if (generated_code_execute_base_ == generated_code_write_base_) {
-        xe::memory::AllocFixed(generated_code_execute_base_, new_commit_mark,
-                               xe::memory::AllocationType::kCommit,
-                               xe::memory::PageAccess::kExecuteReadWrite);
-      } else {
-        xe::memory::AllocFixed(generated_code_execute_base_, new_commit_mark,
-                               xe::memory::AllocationType::kCommit,
-                               xe::memory::PageAccess::kExecuteReadOnly);
-        xe::memory::AllocFixed(generated_code_write_base_, new_commit_mark,
-                               xe::memory::AllocationType::kCommit,
-                               xe::memory::PageAccess::kReadWrite);
-      }
-    } while (generated_code_commit_mark_.compare_exchange_weak(
-        old_commit_mark, new_commit_mark));
+    if (high_mark > kGeneratedCodeSize) {
+      xe::FatalError("JIT code cache capacity exceeded");
+    }
+    // Callers hold global_critical_region_. macOS MAP_JIT storage is already
+    // committed; mprotect must not be used to change its per-thread protection.
+    if (high_mark <= generated_code_commit_mark_) {
+      return;
+    }
+    size_t new_commit_mark = xe::round_up(high_mark, size_t(16_MiB));
+    if (generated_code_execute_base_ == generated_code_write_base_) {
+      xe::memory::AllocFixed(generated_code_execute_base_, new_commit_mark,
+                             xe::memory::AllocationType::kCommit,
+                             xe::memory::PageAccess::kExecuteReadWrite);
+    } else {
+      xe::memory::AllocFixed(generated_code_execute_base_, new_commit_mark,
+                             xe::memory::AllocationType::kCommit,
+                             xe::memory::PageAccess::kExecuteReadOnly);
+      xe::memory::AllocFixed(generated_code_write_base_, new_commit_mark,
+                             xe::memory::AllocationType::kCommit,
+                             xe::memory::PageAccess::kReadWrite);
+    }
+    generated_code_commit_mark_ = new_commit_mark;
   }
 };
 

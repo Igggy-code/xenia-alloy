@@ -25,6 +25,17 @@
 #include "xenia/cpu/hir/label.h"
 #include "xenia/cpu/processor.h"
 
+#include <cstdio>
+#include <mutex>
+
+#include "xenia/base/cvar.h"
+
+DEFINE_string(a64_function_map_path, "",
+              "Debug: if set, writes the host code range and the source map "
+              "of every JIT-compiled guest function to this file, so host "
+              "PCs from macOS `sample` output can be mapped to guest code.",
+              "CPU");
+
 namespace xe {
 namespace cpu {
 namespace backend {
@@ -91,12 +102,33 @@ bool A64Assembler::Assemble(GuestFunction* function, HIRBuilder* builder,
   static_cast<A64Function*>(function)->Setup(
       reinterpret_cast<uint8_t*>(machine_code), code_size);
 
+  if (!cvars::a64_function_map_path.empty()) {
+    static std::mutex map_mutex;
+    static FILE* map_file = nullptr;
+    std::lock_guard<std::mutex> lock(map_mutex);
+    if (!map_file) {
+      map_file = std::fopen(cvars::a64_function_map_path.c_str(), "w");
+    }
+    if (map_file) {
+      std::fprintf(map_file, "F %08X %016llX %zX\n", function->address(),
+                   (unsigned long long)reinterpret_cast<uintptr_t>(machine_code),
+                   code_size);
+      for (const SourceMapEntry& entry : function->source_map()) {
+        std::fprintf(map_file, "S %X %08X\n", entry.code_offset,
+                     entry.guest_address);
+      }
+      std::fflush(map_file);
+    }
+  }
+
   // Install into indirection table.
   uint64_t host_address = reinterpret_cast<uint64_t>(machine_code);
+#if !XE_PLATFORM_APPLE
   assert_true((host_address >> 32) == 0);
+#endif
   reinterpret_cast<A64CodeCache*>(backend_->code_cache())
       ->AddIndirection(function->address(),
-                       static_cast<uint32_t>(host_address));
+                       static_cast<uintptr_t>(host_address));
 
   return true;
 }

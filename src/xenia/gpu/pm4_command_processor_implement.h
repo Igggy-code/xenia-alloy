@@ -1,5 +1,12 @@
 #pragma once
 
+// Hook called before the command processor makes GPU progress visible to the
+// guest CPU (fence / memory writes, interrupts). Backends whose GPU work may
+// still be in flight at that point can wait for it here.
+#ifndef XE_PM4_GUEST_VISIBLE_SYNC
+#define XE_PM4_GUEST_VISIBLE_SYNC() ((void)0)
+#endif
+
 #if !defined(NDEBUG)
 #define XE_ENABLE_PM4_DISASM 1
 #endif
@@ -408,6 +415,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3(uint32_t packet) XE_RESTRICT {
     // & 1 == predicate - when set, we do bin check to see if we should execute
     // the packet. Only type 3 packets are affected.
     // We also skip predicated swaps, as they are never valid (probably?).
+    if (opcode == PM4_XE_SWAP) {
+      static uint32_t xe_swap_seen = 0;
+      if (++xe_swap_seen <= 3 || (xe_swap_seen % 120) == 0) {
+        XELOGI("CP: PM4_XE_SWAP #{} at {:08X} predicated={} bin_select={:X} "
+               "bin_mask={:X}",
+               xe_swap_seen, uint32_t(reader_.read_ptr() - 4), packet & 1,
+               bin_select_, bin_mask_);
+      }
+    }
     if (packet & 1) {
       bool any_pass = (bin_select_ & bin_mask_) != 0;
       if (!any_pass || opcode == PM4_XE_SWAP) {
@@ -633,6 +649,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_INTERRUPT(
 
   // generate interrupt from the command stream
   uint32_t cpu_mask = reader_.ReadAndSwap<uint32_t>();
+  XE_PM4_GUEST_VISIBLE_SYNC();
   for (int n = 0; n < 6; n++) {
     if (cpu_mask & (1 << n)) {
       graphics_system_->DispatchInterruptCallback(1, n);
@@ -715,6 +732,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
                 : register_file_->values[poll_reg_addr];
 
   bool matched = false;
+  uint32_t wait_iterations = 0;
 
   do {
     uint32_t value = value_ref;
@@ -730,6 +748,15 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_WAIT_REG_MEM(
       }
     }
     matched = MatchValueAndRef(value & mask, ref, wait_info);
+
+    if (!matched && ++wait_iterations >= 1024 &&
+        (wait_iterations & (wait_iterations - 1)) == 0) {
+      XELOGW(
+          "WAIT_REG_MEM still waiting: {} {:08X} value={:08X} mask={:08X} "
+          "ref={:08X} func={} wait={:X} iterations={}",
+          is_memory ? "mem" : "reg", poll_reg_addr, value, mask, ref,
+          wait_info & 0x7, wait, wait_iterations);
+    }
 
     if (!matched) {
       // Wait.
@@ -788,6 +815,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_REG_TO_MEM(
 
   uint32_t reg_addr = reader_.ReadAndSwap<uint32_t>();
   uint32_t mem_addr = reader_.ReadAndSwap<uint32_t>();
+  XE_PM4_GUEST_VISIBLE_SYNC();
 
   uint32_t reg_val;
 
@@ -806,6 +834,7 @@ XE_NOINLINE
 bool COMMAND_PROCESSOR::ExecutePacketType3_MEM_WRITE(
     uint32_t packet, uint32_t count) XE_RESTRICT {
   uint32_t write_addr = reader_.ReadAndSwap<uint32_t>();
+  XE_PM4_GUEST_VISIBLE_SYNC();
   for (uint32_t i = 0; i < count - 1; i++) {
     uint32_t write_data = reader_.ReadAndSwap<uint32_t>();
 
@@ -829,6 +858,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_COND_WRITE(
   uint32_t mask = reader_.ReadAndSwap<uint32_t>();
   uint32_t write_reg_addr = reader_.ReadAndSwap<uint32_t>();
   uint32_t write_data = reader_.ReadAndSwap<uint32_t>();
+  XE_PM4_GUEST_VISIBLE_SYNC();
   uint32_t value;
   if (wait_info & 0x10) {
     // Memory.
@@ -887,6 +917,7 @@ bool COMMAND_PROCESSOR::ExecutePacketType3_EVENT_WRITE_SHD(
   uint32_t initiator = reader_.ReadAndSwap<uint32_t>();
   uint32_t address = reader_.ReadAndSwap<uint32_t>();
   uint32_t value = reader_.ReadAndSwap<uint32_t>();
+  XE_PM4_GUEST_VISIBLE_SYNC();
   // Writeback initiator.
   COMMAND_PROCESSOR::WriteEventInitiator(initiator & 0x3F);
   uint32_t data_value;

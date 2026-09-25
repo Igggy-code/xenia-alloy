@@ -54,7 +54,14 @@ static uint64_t UndefinedCallExtern(void* raw_context, uint64_t function_ptr) {
   return 0;
 }
 
-static constexpr size_t kMaxCodeSize = 1_MiB;
+// Large guest functions (heavy FP code with PPC NaN semantics expands to
+// ~30 host instructions per FMA) can exceed 1 MiB of ARM64 code; Fable II hits
+// this when entering gameplay.
+static constexpr size_t kMaxCodeSize = 8_MiB;
+// HIR instruction count above which conditional branches are emitted in the
+// long-range form (b.cond/cbz reach only +-1 MiB). Worst-case sequences are
+// ~120 bytes per HIR instruction.
+static constexpr size_t kFarBranchHirThreshold = 4000;
 
 // Register maps:
 // GPR allocatable registers: x22, x23, x24, x25, x26, x27, x28
@@ -94,17 +101,63 @@ bool A64Emitter::Emit(GuestFunction* function, hir::HIRBuilder* builder,
 
   current_guest_function_ = function->address();
 
-  // Reset state.
-  stack_size_ = StackLayout::GUEST_STACK_SIZE;
-  source_map_arena_.Reset();
-  tail_code_.clear();
-  fpcr_mode_ = FPCRMode::Unknown;
-
-  // Try to emit.
-  EmitFunctionInfo func_info = {};
-  if (!Emit(builder, func_info)) {
-    return false;
+  // Try to emit. If the function is too large for short conditional branches,
+  // emit it once more with far branches.
+  // Re-emitting from the same HIR after a failed attempt is not reliable, so
+  // very large functions use far branches from the start.
+  size_t hir_instr_count = 0;
+  for (auto block = builder->first_block(); block; block = block->next) {
+    for (auto instr = block->instr_head; instr; instr = instr->next) {
+      ++hir_instr_count;
+    }
   }
+  const bool far_branches_first = hir_instr_count > kFarBranchHirThreshold;
+  if (far_branches_first) {
+    XELOGI("A64Emitter: guest function {:08X} has {} HIR instructions, "
+           "using far branches",
+           function->address(), hir_instr_count);
+  }
+
+  EmitFunctionInfo func_info = {};
+  bool emitted = false;
+  for (int attempt = far_branches_first ? 1 : 0; attempt < 2 && !emitted;
+       ++attempt) {
+    far_branches_ = attempt != 0;
+    // Reset state.
+    stack_size_ = StackLayout::GUEST_STACK_SIZE;
+    source_map_arena_.Reset();
+    tail_code_.clear();
+    fpcr_mode_ = FPCRMode::Unknown;
+    synchronize_stack_on_next_instruction_ = false;
+    func_info = {};
+    try {
+      if (!Emit(builder, func_info)) {
+        DiscardEmittedCode();
+        far_branches_ = false;
+        return false;
+      }
+      emitted = true;
+    } catch (const Xbyak_aarch64::Error& ex) {
+      const bool retry =
+          !far_branches_ && ex == Xbyak_aarch64::ERR_LABEL_IS_TOO_FAR;
+      XELOGW("A64Emitter: guest function {:08X} ({} bytes emitted): {}{}",
+             function->address(), getSize(), ex.what(),
+             retry ? "; retrying with far branches" : "");
+      DiscardEmittedCode();
+      if (!retry) {
+        far_branches_ = false;
+        return false;
+      }
+    } catch (const std::exception& ex) {
+      XELOGE("A64Emitter: failed to emit guest function {:08X} ({} bytes "
+             "emitted): {}",
+             function->address(), getSize(), ex.what());
+      DiscardEmittedCode();
+      far_branches_ = false;
+      return false;
+    }
+  }
+  far_branches_ = false;
 
   // Emplace the code into the code cache.
   *out_code_address = Emplace(func_info, function);
@@ -362,7 +415,13 @@ void A64Emitter::Call(const hir::Instr* instr, GuestFunction* function) {
   if (code_cache_->has_indirection_table()) {
     // Load host code address from indirection table.
     mov(w16, function->address());
+#if XE_PLATFORM_APPLE
+    mov(x9, code_cache_->indirection_table_base() - (uint64_t(0x80000000) * 2));
+    add(x9, x9, x16, LSL, 1);
+    ldr(x9, ptr(x9));
+#else
     ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
+#endif
   } else {
     // Fallback: resolve at runtime.
     mov(x0, x20);  // context
@@ -405,8 +464,13 @@ void A64Emitter::CallIndirect(const hir::Instr* instr, int reg_index) {
   // Load host code address from indirection table.
   if (code_cache_->has_indirection_table()) {
     mov(w16, target_w);  // w16 = guest address (also used by resolve thunk)
-    ldr(w9, ptr(x16, static_cast<uint32_t>(
-                         0)));  // w9 = host code from indirection table
+#if XE_PLATFORM_APPLE
+    mov(x9, code_cache_->indirection_table_base() - (uint64_t(0x80000000) * 2));
+    add(x9, x9, x16, LSL, 1);
+    ldr(x9, ptr(x9));
+#else
+    ldr(w9, ptr(x16, static_cast<uint32_t>(0)));
+#endif
   } else {
     // Fallback: resolve at runtime.
     mov(w16, target_w);
@@ -521,6 +585,20 @@ Label& A64Emitter::AddToTail(TailEmitCallback callback, uint32_t alignment) {
   return tail_code_.back().label;
 }
 
+void A64Emitter::DiscardEmittedCode() {
+  reset();
+  tail_code_.clear();
+  for (auto* cached_label : label_cache_) {
+    delete cached_label;
+  }
+  label_cache_.clear();
+  for (auto& pair : label_map_) {
+    delete pair.second;
+  }
+  label_map_.clear();
+  epilog_label_ = nullptr;
+}
+
 Label& A64Emitter::NewCachedLabel() {
   auto* label = new Label();
   label_cache_.push_back(label);
@@ -615,6 +693,19 @@ void A64Emitter::EnsureSynchronizedGuestAndHostStack() {
   ldr(w16, ptr(sp, static_cast<uint32_t>(
                        StackLayout::GUEST_SAVED_STACKPOINT_DEPTH)));
   cmp(w17, w16);
+
+  if (far_branches_) {
+    // Huge function: tail code may be more than 1 MiB away, beyond the reach
+    // of adr, so emit the fixup call inline.
+    CodeGenerator::b(EQ, return_from_sync);
+    adr(x8, return_from_sync);
+    mov(x9, static_cast<uint64_t>(stack_size()));
+    mov(x10, reinterpret_cast<uint64_t>(
+                 backend()->synchronize_guest_and_host_stack_helper()));
+    br(x10);
+    L(return_from_sync);
+    return;
+  }
 
   auto& sync_label = AddToTail([&return_from_sync](A64Emitter& e, Label& lbl) {
     // Set up arguments for the sync helper:

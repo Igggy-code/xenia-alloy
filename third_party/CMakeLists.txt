@@ -36,6 +36,25 @@ add_library(aes_128 STATIC
 )
 target_include_directories(aes_128 PUBLIC aes_128)
 
+if(APPLE)
+  include("${PROJECT_SOURCE_DIR}/cmake/MetalShaderConverter.cmake")
+  add_library(metal-cpp INTERFACE)
+  target_include_directories(metal-cpp INTERFACE
+    ${CMAKE_CURRENT_SOURCE_DIR}/metal-cpp)
+  target_link_libraries(metal-cpp INTERFACE
+    "-framework Foundation" "-framework Metal" "-framework QuartzCore")
+
+  add_library(spirv-cross STATIC
+    SPIRV-Cross/spirv_cross.cpp
+    SPIRV-Cross/spirv_cross_parsed_ir.cpp
+    SPIRV-Cross/spirv_parser.cpp
+    SPIRV-Cross/spirv_cfg.cpp
+    SPIRV-Cross/spirv_cross_util.cpp
+    SPIRV-Cross/spirv_glsl.cpp
+    SPIRV-Cross/spirv_msl.cpp)
+  target_include_directories(spirv-cross PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/SPIRV-Cross)
+endif()
+
 # ==============================================================================
 # capstone
 # ==============================================================================
@@ -144,21 +163,19 @@ add_library(fmt STATIC
 target_include_directories(fmt PUBLIC fmt/include)
 
 # ==============================================================================
-# glslang-spirv (not needed on macOS — no Vulkan/SPIR-V backend)
+# glslang-spirv (also used by the Metal shader translator)
 # ==============================================================================
-if(NOT APPLE)
-  file(GLOB _glslang_spirv_cpp "glslang/SPIRV/*.cpp")
-  file(GLOB _glslang_spirv_h "glslang/SPIRV/*.h")
-  file(GLOB _glslang_spirv_hpp "glslang/SPIRV/*.hpp11")
-  list(FILTER _glslang_spirv_cpp EXCLUDE REGEX "GlslangToSpv\\.cpp$")
-  add_library(glslang-spirv STATIC
-    ${_glslang_spirv_cpp}
-    ${_glslang_spirv_h}
-    ${_glslang_spirv_hpp}
-    glslang/glslang/Include/visibility.h
-  )
-  target_include_directories(glslang-spirv PUBLIC glslang)
-endif()
+file(GLOB _glslang_spirv_cpp "glslang/SPIRV/*.cpp")
+file(GLOB _glslang_spirv_h "glslang/SPIRV/*.h")
+file(GLOB _glslang_spirv_hpp "glslang/SPIRV/*.hpp11")
+list(FILTER _glslang_spirv_cpp EXCLUDE REGEX "GlslangToSpv\\.cpp$")
+add_library(glslang-spirv STATIC
+  ${_glslang_spirv_cpp}
+  ${_glslang_spirv_h}
+  ${_glslang_spirv_hpp}
+  glslang/glslang/Include/visibility.h
+)
+target_include_directories(glslang-spirv PUBLIC glslang)
 
 # ==============================================================================
 # imgui
@@ -195,6 +212,12 @@ target_include_directories(pugixml PUBLIC pugixml/src)
 # ==============================================================================
 # snappy
 # ==============================================================================
+if(APPLE)
+  set(SNAPPY_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(SNAPPY_BUILD_BENCHMARKS OFF CACHE BOOL "" FORCE)
+  set(SNAPPY_INSTALL OFF CACHE BOOL "" FORCE)
+  add_subdirectory(snappy EXCLUDE_FROM_ALL)
+else()
 # Generate snappy-stubs-public.h if missing
 if(NOT EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/snappy/snappy-stubs-public.h")
   if(XE_TARGET_X86_64)
@@ -223,6 +246,7 @@ add_library(snappy STATIC
   snappy/snappy.h
 )
 target_include_directories(snappy PUBLIC snappy)
+endif()
 
 # ==============================================================================
 # xxhash
@@ -275,6 +299,20 @@ target_link_libraries(zarchive PUBLIC zstd)
 # ==============================================================================
 # zlib-ng
 # ==============================================================================
+if(APPLE)
+  set(ZLIB_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+  set(ZLIBNG_ENABLE_TESTS OFF CACHE BOOL "" FORCE)
+  set(WITH_GTEST OFF CACHE BOOL "" FORCE)
+  set(ZLIB_COMPAT OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  # This pinned zlib-ng release only accepts C99 or C11 in its configure checks.
+  set(_xe_saved_c_standard "${CMAKE_C_STANDARD}")
+  set(CMAKE_C_STANDARD 11)
+  add_subdirectory(zlib-ng EXCLUDE_FROM_ALL)
+  set(CMAKE_C_STANDARD "${_xe_saved_c_standard}")
+  add_library(zlib-ng INTERFACE)
+  target_link_libraries(zlib-ng INTERFACE zlibstatic)
+else()
 # Generate headers if missing
 set(_zlibng_needs_configure FALSE)
 foreach(_hdr zlib-ng.h zconf-ng.h zlib_name_mangling-ng.h gzread.c)
@@ -357,6 +395,7 @@ else()
   endif()
 endif()
 target_include_directories(zlib-ng PUBLIC zlib-ng)
+endif()
 
 # ==============================================================================
 # libusb (Windows only)
@@ -450,11 +489,15 @@ if(WIN32)
   target_include_directories(SDL2 PUBLIC SDL2/include)
   target_link_libraries(SDL2 PRIVATE setupapi winmm imm32 version)
 elseif(APPLE)
-  # Use system SDL2 framework on macOS
+  # Use the pinned SDL source on macOS too, avoiding an external Homebrew or
+  # framework dependency and keeping the headers and library in sync.
+  set(SDL_SHARED OFF CACHE BOOL "" FORCE)
+  set(SDL_STATIC ON CACHE BOOL "" FORCE)
+  set(SDL_TEST OFF CACHE BOOL "" FORCE)
+  set(SDL_TESTS OFF CACHE BOOL "" FORCE)
+  add_subdirectory(SDL2 EXCLUDE_FROM_ALL)
   add_library(SDL2 INTERFACE)
-  find_library(SDL2_LIBRARY SDL2 REQUIRED)
-  target_include_directories(SDL2 INTERFACE "${SDL2_LIBRARY}/Headers")
-  target_link_libraries(SDL2 INTERFACE "${SDL2_LIBRARY}")
+  target_link_libraries(SDL2 INTERFACE SDL2-static)
 elseif(CMAKE_SYSTEM_NAME STREQUAL "Linux")
   # Use system SDL2 on Linux
   add_library(SDL2 INTERFACE)
@@ -787,6 +830,9 @@ target_include_directories(libavcodec PRIVATE
 )
 target_link_libraries(libavcodec PRIVATE libavutil)
 ffmpeg_common(libavcodec)
+if(APPLE)
+  target_link_libraries(libavcodec PUBLIC iconv)
+endif()
 
 # --- libavformat ---
 add_library(libavformat STATIC

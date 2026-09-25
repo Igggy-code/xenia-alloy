@@ -131,7 +131,7 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
 #if XE_PLATFORM_WIN32
             constexpr double duration_scalar = 0.90;
 #endif
-#if XE_PLATFORM_LINUX
+#if XE_PLATFORM_LINUX || XE_PLATFORM_MAC
             constexpr double duration_scalar = 1.0;
 #endif
 
@@ -181,8 +181,10 @@ X_STATUS GraphicsSystem::Setup(cpu::Processor* processor,
                 }
               }
 #endif
-#if XE_PLATFORM_LINUX
-              // Linux: Use simplified timing logic to avoid oversleeping
+#if XE_PLATFORM_LINUX || XE_PLATFORM_MAC
+              // Linux/macOS: Use simplified timing logic to avoid oversleeping.
+              // Without this branch macOS never raised vblank interrupts and
+              // the thread busy-looped, deadlocking titles such as Fable II.
               MarkVblank();
 
               if (cvars::vsync || normalized_framerate_limit > 0) {

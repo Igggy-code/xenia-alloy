@@ -18,6 +18,17 @@ DECLARE_path(dump_shaders);
 
 DECLARE_bool(vsync);
 
+DECLARE_bool(metal_shader_disk_cache);
+DECLARE_bool(metal_pipeline_binary_archive);
+DECLARE_bool(metal_pipeline_disk_cache);
+DECLARE_int32(metal_draw_ring_count);
+DECLARE_bool(metal_use_heaps);
+DECLARE_bool(metal_shared_memory_zero_copy);
+DECLARE_int32(metal_heap_min_bytes);
+DECLARE_bool(metal_texture_cache_use_private);
+DECLARE_bool(metal_texture_upload_via_blit);
+DECLARE_bool(metal_use_spirvcross);
+
 DECLARE_uint64(framerate_limit);
 
 DECLARE_bool(gpu_allow_invalid_fetch_constants);

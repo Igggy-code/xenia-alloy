@@ -27,7 +27,7 @@ namespace backend {
 namespace a64 {
 
 // Maximum size of DWARF .eh_frame data per function (CIE + FDE + terminator).
-static constexpr uint32_t kMaxUnwindInfoSize = 128;
+static constexpr uint32_t kMaxUnwindInfoSize = 192;
 
 // DWARF register numbers for AArch64.
 static constexpr uint8_t kDwarfRegX19 = 19;
@@ -55,6 +55,7 @@ static constexpr uint8_t kDwarfRegD15 = 79;
 // DWARF CFA opcodes.
 static constexpr uint8_t kDW_CFA_advance_loc1 = 0x02;
 static constexpr uint8_t kDW_CFA_advance_loc2 = 0x03;
+static constexpr uint8_t kDW_CFA_offset_extended = 0x05;
 static constexpr uint8_t kDW_CFA_def_cfa = 0x0c;
 static constexpr uint8_t kDW_CFA_def_cfa_offset = 0x0e;
 static constexpr uint8_t kDW_CFA_nop = 0x00;
@@ -163,6 +164,13 @@ void PosixA64CodeCache::PlaceCode(uint32_t guest_address, void* machine_code,
   void* unwind_execute_address = unwind_reservation.entry_address -
                                  generated_code_write_base_ +
                                  generated_code_execute_base_;
+#if XE_PLATFORM_APPLE
+  // Darwin registers one FDE; libgcc on ELF accepts the CIE at the start of
+  // an entire .eh_frame section. Keep the CIE immediately before this FDE.
+  auto* cie = static_cast<uint8_t*>(unwind_execute_address);
+  unwind_execute_address = cie + sizeof(uint32_t) +
+                           *reinterpret_cast<const uint32_t*>(cie);
+#endif
   __register_frame(unwind_execute_address);
   registered_frames_.push_back(unwind_execute_address);
 }
@@ -277,7 +285,7 @@ void PosixA64CodeCache::InitializeUnwindEntry(
     *p++ = kDW_CFA_def_cfa_offset;
     p += WriteULEB128(p, func_info.stack_size);
 
-    if (func_info.stack_size == StackLayout::THUNK_STACK_SIZE) {
+    if (func_info.saves_host_registers) {
       // Thunk: encode all callee-saved register save locations.
       // See a64_stack_layout.h for the layout.
       size_t cfa = func_info.stack_size;  // 224
@@ -314,21 +322,29 @@ void PosixA64CodeCache::InitializeUnwindEntry(
       // stp q10,q11 at sp+0x080: d10=sp+0x080, d11=sp+0x090
       // stp q12,q13 at sp+0x0A0: d12=sp+0x0A0, d13=sp+0x0B0
       // stp q14,q15 at sp+0x0C0: d14=sp+0x0C0, d15=sp+0x0D0
-      *p++ = 0x80 | kDwarfRegD8;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD8);
       p += WriteULEB128(p, (cfa - 0x060) / 8);
-      *p++ = 0x80 | kDwarfRegD9;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD9);
       p += WriteULEB128(p, (cfa - 0x070) / 8);
-      *p++ = 0x80 | kDwarfRegD10;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD10);
       p += WriteULEB128(p, (cfa - 0x080) / 8);
-      *p++ = 0x80 | kDwarfRegD11;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD11);
       p += WriteULEB128(p, (cfa - 0x090) / 8);
-      *p++ = 0x80 | kDwarfRegD12;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD12);
       p += WriteULEB128(p, (cfa - 0x0A0) / 8);
-      *p++ = 0x80 | kDwarfRegD13;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD13);
       p += WriteULEB128(p, (cfa - 0x0B0) / 8);
-      *p++ = 0x80 | kDwarfRegD14;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD14);
       p += WriteULEB128(p, (cfa - 0x0C0) / 8);
-      *p++ = 0x80 | kDwarfRegD15;
+      *p++ = kDW_CFA_offset_extended;
+      p += WriteULEB128(p, kDwarfRegD15);
       p += WriteULEB128(p, (cfa - 0x0D0) / 8);
     } else if (func_info.lr_save_offset > 0) {
       // Record where x30 (LR / return address) is saved.

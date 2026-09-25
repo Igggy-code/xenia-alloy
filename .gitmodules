@@ -103,3 +103,15 @@
 [submodule "third_party/xbyak_aarch64"]
 	path = third_party/xbyak_aarch64
 	url = https://github.com/fujitsu/xbyak_aarch64.git
+[submodule "third_party/metal-cpp"]
+  path = third_party/metal-cpp
+  url = https://github.com/wmarti/metal-cpp.git
+[submodule "third_party/SPIRV-Cross"]
+  path = third_party/SPIRV-Cross
+  url = https://github.com/KhronosGroup/SPIRV-Cross.git
+[submodule "third_party/metal-shader-converter"]
+  path = third_party/metal-shader-converter
+  url = https://github.com/wmarti/metal-shader-converter.git
+[submodule "third_party/DirectXShaderCompiler-mac"]
+  path = third_party/DirectXShaderCompiler-mac
+  url = https://github.com/wmarti/DirectXShaderCompiler.git

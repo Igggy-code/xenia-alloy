@@ -58,6 +58,21 @@ uint XeEdramOffsetBytes(uint2_xe pixel_index, uint base_tiles, bool wrap,
   uint2_xe pixel = pixel_index / resolution_scale;
   uint2_xe subpixel = pixel_index - pixel * resolution_scale;
   uint2_xe guest_sample;
+#ifdef SHADING_LANGUAGE_MSL_XE
+  // The Metal render target cache (ported from Xenia Edge) stores host render
+  // targets into EDRAM with the previous layout, where each pixel's samples
+  // form a 2x2 (4x) or 1x2 (2x) block, 4x sample bit 1 being horizontal and
+  // bit 0 vertical, 2x sample 1 being the bottom one. Resolves must read the
+  // same layout, otherwise multisampled render targets come out scrambled.
+  if (msaa_samples >= kXenosMsaaSamples_4X) {
+    guest_sample = (pixel << 1u) |
+                   ((uint_x2_xe(pixel_sample_index) >> uint2_xe(1u, 0u)) & 1u);
+  } else if (msaa_samples == kXenosMsaaSamples_2X) {
+    guest_sample = uint2_xe(pixel.x, (pixel.y << 1u) | (pixel_sample_index & 1u));
+  } else {
+    guest_sample = pixel;
+  }
+#else
   if (msaa_samples >= kXenosMsaaSamples_4X) {
     uint2_xe sample_offset =
         (uint_x2_xe(pixel_sample_index) >> uint2_xe(0u, 1u)) & 1u;
@@ -68,6 +83,7 @@ uint XeEdramOffsetBytes(uint2_xe pixel_index, uint base_tiles, bool wrap,
   } else {
     guest_sample = pixel;
   }
+#endif  // SHADING_LANGUAGE_MSL_XE
   uint2_xe rt_sample_index = guest_sample * resolution_scale + subpixel;
   // For now, while the actual storage of 64bpp render targets in comparison to
   // 32bpp is not known, storing 40x16 64bpp samples per tile for simplicity of

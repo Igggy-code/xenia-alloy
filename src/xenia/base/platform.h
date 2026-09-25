@@ -27,8 +27,13 @@
 #include <TargetConditionals.h>
 #endif
 
-#if defined(TARGET_OS_MAC) && TARGET_OS_MAC
+#if defined(__APPLE__)
+#define XE_PLATFORM_APPLE 1
+#if TARGET_OS_IOS || TARGET_OS_IPHONE
+#define XE_PLATFORM_IOS 1
+#elif TARGET_OS_MAC
 #define XE_PLATFORM_MAC 1
+#endif
 #elif defined(WIN32) || defined(_WIN32)
 #define XE_PLATFORM_WIN32 1
 #elif defined(__ANDROID__)

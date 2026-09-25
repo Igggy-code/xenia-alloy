@@ -21,7 +21,9 @@
 #include "xenia/gpu/shader_translator.h"
 #include "xenia/gpu/spirv_builder.h"
 #include "xenia/gpu/xenos.h"
+#if !XE_PLATFORM_MAC
 #include "xenia/ui/vulkan/vulkan_device.h"
+#endif
 
 namespace xe {
 namespace gpu {
@@ -410,7 +412,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
   static constexpr uint32_t kSpirvMagicToolId = 26;
 
   struct Features {
+#if !XE_PLATFORM_MAC
     explicit Features(const ui::vulkan::VulkanDevice* vulkan_device);
+#endif
     explicit Features(bool all = false);
 
     unsigned int spirv_version;

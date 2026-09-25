@@ -94,6 +94,7 @@ node_modules/.bin/
 /build/
 /build-arm64/
 /build-x64/
+/build-macos-*/
 
 # ==============================================================================
 # Local-only paths
@@ -116,3 +117,14 @@ node_modules/.bin/
 /cache0
 /devkit
 recent.toml
+
+# ==============================================================================
+# Local development scripts and diagnostics (not part of the sources)
+# ==============================================================================
+
+/tools/run_*.sh
+/tools/local/
+*.ips
+*.trace
+jitmap*.txt
+sample*.txt

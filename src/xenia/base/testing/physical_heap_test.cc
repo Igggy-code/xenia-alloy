@@ -161,16 +161,21 @@ TEST_CASE("PhysicalHeap vE0000000 alignment", "[memory]") {
     REQUIRE(translation_offset % heap.page_size() == 0);
   }
 
-  SECTION("alloc with alignment larger than page_size is rejected") {
-    // vE0000000 has a 0x1000 physical translation offset, so the host
-    // alignment check in PhysicalHeap::Alloc, which tests
-    // (address + host_address_offset_) % alignment, cannot be satisfied for
-    // an alignment above the page size where that offset is 0.
-    uint32_t alignment = 0x10000;  // 64KB
+  SECTION("large alignment respects the host physical mapping offset") {
+    // Hosts with allocation granularity above 4KB compensate the physical
+    // offset in their virtual mapping. This allows the physical allocation
+    // to remain aligned even though its guest virtual address is offset.
+    uint32_t alignment = 0x10000;
     uint32_t addr = 0;
     bool ok = heap.Alloc(0x10000, alignment, kMemoryAllocationReserve,
                          kMemoryProtectRead, false, &addr);
-    REQUIRE_FALSE(ok);
+    if (xe::memory::allocation_granularity() > 0x1000) {
+      REQUIRE(ok);
+      REQUIRE(heap.GetPhysicalAddress(addr) % alignment == 0);
+      REQUIRE((addr + physical_base) % alignment == 0);
+    } else {
+      REQUIRE_FALSE(ok);
+    }
   }
 }
 

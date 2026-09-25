@@ -48,6 +48,7 @@ SpirvShaderTranslator::Features::Features(bool all)
       fragment_shader_sample_interlock(all),
       demote_to_helper_invocation(all) {}
 
+#if !XE_PLATFORM_MAC
 SpirvShaderTranslator::Features::Features(
     const ui::vulkan::VulkanDevice* const vulkan_device)
     : max_storage_buffer_range(
@@ -82,6 +83,7 @@ SpirvShaderTranslator::Features::Features(
     spirv_version = spv::Spv_1_0;
   }
 }
+#endif  // !XE_PLATFORM_MAC
 
 uint64_t SpirvShaderTranslator::GetDefaultVertexShaderModification(
     uint32_t dynamic_addressable_register_count,
