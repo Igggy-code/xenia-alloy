@@ -92,10 +92,15 @@ class MetalCommandProcessor : public CommandProcessor {
   }
   bool HasActiveRenderEncoder() const { return current_render_encoder_ != nullptr; }
   uint32_t current_draw_index() const { return current_draw_index_; }
+  uint32_t swap_count() const { return swap_count_; }
   uint64_t GetCurrentSubmission() const;
   uint64_t GetCompletedSubmission() const override;
   MTL::CommandBuffer* EnsureCommandBuffer();
   void EndRenderEncoder();
+  // Orders render pass writes to render targets before later compute
+  // encoders (EDRAM dumps) that read them in the same command buffer.
+  void SignalRenderTargetFence(MTL::RenderCommandEncoder* encoder);
+  void WaitRenderTargetFence(MTL::ComputeCommandEncoder* encoder);
   void ResetRenderEncoderResourceUsage();
   void UseRenderEncoderResource(MTL::Resource* resource,
                                 MTL::ResourceUsage usage);
@@ -424,6 +429,7 @@ class MetalCommandProcessor : public CommandProcessor {
   // Current command buffer and encoder
   MTL::CommandBuffer* current_command_buffer_ = nullptr;
   MTL::RenderCommandEncoder* current_render_encoder_ = nullptr;
+  MTL::Fence* render_target_fence_ = nullptr;
   MTL::RenderPassDescriptor* current_render_pass_descriptor_ = nullptr;
   NS::AutoreleasePool* command_buffer_autorelease_pool_ = nullptr;
 
@@ -733,6 +739,8 @@ class MetalCommandProcessor : public CommandProcessor {
   uint64_t guest_gpu_syncs_ = 0;
   std::atomic<uint32_t> current_title_id_{0};
   uint32_t sync_titles_checked_id_ = UINT32_MAX;
+  uint32_t sync_all_titles_checked_id_ = UINT32_MAX;
+  bool sync_all_titles_match_ = false;
   bool sync_titles_match_ = false;
   void NoteGpuWriteForGuest(uint32_t address);
   struct GpuWriteStreak {

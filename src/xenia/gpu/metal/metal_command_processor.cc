@@ -104,6 +104,13 @@ DEFINE_int32(metal_sync_gpu_writes_skip_after_frames, 90,
              "written in every frame for more than this many consecutive frames "
              "are treated as GPU-only and don't trigger waits. 0 = always wait.",
              "GPU");
+DEFINE_string(metal_sync_all_gpu_work_for_guest_titles, "545407EE",
+              "Comma-separated title IDs (hex) for which every guest-visible "
+              "GPU sync point (fences, interrupts) waits for all submitted GPU "
+              "work. Needed with zero-copy shared memory when a title reuses "
+              "vertex/constant memory right after a fence (545407EE = The "
+              "Darkness: garbage band at the top of the frame).",
+              "Metal");
 DEFINE_string(metal_sync_gpu_writes_for_guest_titles, "4D5307F1",
               "Comma-separated title IDs (hex) for which "
               "metal_sync_gpu_writes_for_guest is enabled automatically "
@@ -119,6 +126,23 @@ DEFINE_bool(metal_memexport_sync, false,
             "Wait for the GPU after every draw with memexport so that guest "
             "CPU code reading the exported data sees the finished data. Slow - "
             "diagnostic / compatibility option.",
+            "GPU");
+DECLARE_uint32(metal_debug_log_resolves_every);
+DEFINE_bool(metal_render_target_fence, true,
+            "Use an MTLFence to order render pass writes before EDRAM dump "
+            "compute passes (fixes resolve races, e.g. The Darkness).",
+            "Metal");
+DEFINE_bool(metal_debug_commit_before_resolve, false,
+            "Debug: commit (without CPU wait) the command buffer before each "
+            "resolve.",
+            "Metal");
+DEFINE_bool(metal_debug_flush_before_resolve, false,
+            "Debug: submit and wait for all previous GPU work before every "
+            "resolve (to check for missing synchronization).",
+            "GPU");
+DEFINE_bool(metal_hardware_alpha_to_coverage, false,
+            "Also enable Metal hardware alpha to coverage on top of the "
+            "pixel shader emulation (old behavior, applies it twice).",
             "GPU");
 DEFINE_bool(metal_perf_log, false,
             "Log per-second frame pacing / GPU thread statistics (Perf:).",
@@ -138,6 +162,9 @@ DEFINE_int32(
 namespace xe {
 namespace gpu {
 namespace metal {
+
+// Defined in metal_render_target_cache.cc (debug resolve dumping).
+void MetalDebugDumpLoggedResolves(Memory& memory, uint32_t swap);
 
 namespace {
 
@@ -1082,7 +1109,8 @@ MTL::RenderPipelineState* MetalCommandProcessor::CreateMslPipelineState(
   // Alpha to coverage is emulated in the pixel shader (SV_Coverage output
   // with the guest's dither offsets), like on D3D12 and Vulkan - hardware
   // alpha to coverage on top of it would apply it twice.
-  desc->setAlphaToCoverageEnabled(false);
+  desc->setAlphaToCoverageEnabled(
+      ::cvars::metal_hardware_alpha_to_coverage && request.alpha_to_mask_enable != 0);
 
   for (uint32_t i = 0; i < 4; ++i) {
     auto* color_attachment = desc->colorAttachments()->object(i);
@@ -1505,6 +1533,9 @@ bool MetalCommandProcessor::SetupContext() {
   const ui::metal::MetalProvider& provider = GetMetalProvider();
   device_ = provider.GetDevice();
   command_queue_ = provider.GetCommandQueue();
+  if (device_ && !render_target_fence_) {
+    render_target_fence_ = device_->newFence();
+  }
 
   if (!device_ || !command_queue_) {
     XELOGE("MetalCommandProcessor: No Metal device or command queue available");
@@ -2629,7 +2660,8 @@ void MetalCommandProcessor::PrewarmPipelineBinaryArchive(
     // Alpha to coverage is emulated in the pixel shader (SV_Coverage output
     // with the guest's dither offsets), like on D3D12 and Vulkan - hardware
     // alpha to coverage on top of it would apply it twice.
-    desc->setAlphaToCoverageEnabled(false);
+    desc->setAlphaToCoverageEnabled(
+      ::cvars::metal_hardware_alpha_to_coverage && entry.alpha_to_mask_enable != 0);
 
     for (uint32_t i = 0; i < 4; ++i) {
       auto* color_attachment = desc->colorAttachments()->object(i);
@@ -2728,6 +2760,17 @@ void MetalCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr,
                                       uint32_t frontbuffer_height) {
   ProcessCompletedSubmissions();
   ++swap_count_;
+  if (::cvars::metal_debug_log_resolves_every &&
+      swap_count_ % ::cvars::metal_debug_log_resolves_every <= 1) {
+    XELOGI("ResolveLog swap {} frontbuffer {:08X} {}x{}", swap_count_,
+           frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+  }
+  if (::cvars::metal_debug_log_resolves_every &&
+      swap_count_ % ::cvars::metal_debug_log_resolves_every == 1) {
+    // Let the GPU finish the logged frame before reading its resolves.
+    CommitAndWaitCurrentCommandBuffer();
+    MetalDebugDumpLoggedResolves(*memory_, swap_count_ - 1);
+  }
   ++g_render_stats.swaps;
   PerfOnSwap();
   {
@@ -3572,6 +3615,62 @@ bool MetalCommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type,
     mtl_scissor.width = scissor.extent[0];
     mtl_scissor.height = scissor.extent[1];
     current_render_encoder_->setScissorRect(mtl_scissor);
+
+    if (uint32_t every = ::cvars::metal_debug_log_resolves_every) {
+      if (!(swap_count_ % every)) {
+        auto log_si = regs.Get<reg::RB_SURFACE_INFO>();
+        auto log_ci = regs.Get<reg::RB_COLOR_INFO>(
+            reg::RB_COLOR_INFO::rt_register_indices[0]);
+        auto log_di = regs.Get<reg::RB_DEPTH_INFO>();
+        auto log_wo = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
+        XELOGI(
+            "DrawLog swap {} draw {} prim {} count {} surface {:08X} "
+            "color0 {:08X} "
+            "depth {:08X} depthctl {:08X} mask {:04X} ps {} win_off {:08X} "
+            "vp {:.0f},{:.0f} {:.0f}x{:.0f} sc {},{} {}x{} rt {}x{} "
+            "colorctl {:08X} blend0 {:08X} ps_kill {} ps_hash {:016X} "
+            "vs_hash {:016X}",
+            swap_count_, current_draw_index_, uint32_t(primitive_type),
+            index_count, log_si.value,
+            log_ci.value, log_di.value, depth_control.value,
+            normalized_color_mask, pixel_shader ? 1 : 0, log_wo.value,
+            mtl_viewport.originX, mtl_viewport.originY, mtl_viewport.width,
+            mtl_viewport.height, mtl_scissor.x, mtl_scissor.y,
+            mtl_scissor.width, mtl_scissor.height, vp_width, vp_height,
+            regs.Get<reg::RB_COLORCONTROL>().value,
+            regs.Get<reg::RB_BLENDCONTROL>(
+                    reg::RB_BLENDCONTROL::rt_register_indices[0])
+                .value,
+            pixel_shader ? (pixel_shader->kills_pixels() ? 1 : 0) : 0,
+            pixel_shader ? pixel_shader->ucode_data_hash() : 0,
+            vertex_shader->ucode_data_hash());
+        if (primitive_type == xenos::PrimitiveType::kTriangleList &&
+            index_count == 6 && !vertex_shader->vertex_bindings().empty()) {
+          const float* vc = reinterpret_cast<const float*>(
+              &regs.values[XE_GPU_REG_SHADER_CONSTANT_000_X]);
+          std::string cs;
+          for (uint32_t c : {0u, 1u, 2u, 3u, 7u}) {
+            cs += fmt::format(" c{}=({:.3f},{:.3f},{:.3f},{:.3f})", c,
+                              vc[c * 4], vc[c * 4 + 1], vc[c * 4 + 2],
+                              vc[c * 4 + 3]);
+          }
+          xenos::xe_gpu_vertex_fetch_t log_vf = regs.GetVertexFetch(
+              vertex_shader->vertex_bindings()[0].fetch_constant);
+          const uint8_t* vdata =
+              memory_->TranslatePhysical<const uint8_t*>(log_vf.address << 2);
+          std::string vs;
+          uint32_t stride = vertex_shader->vertex_bindings()[0].stride_words;
+          for (uint32_t v = 0; v < 6 && stride; ++v) {
+            vs += fmt::format(
+                " ({:.1f},{:.1f},{:.1f})",
+                xe::load_and_swap<float>(vdata + v * stride * 4),
+                xe::load_and_swap<float>(vdata + v * stride * 4 + 4),
+                xe::load_and_swap<float>(vdata + v * stride * 4 + 8));
+          }
+          XELOGI("DrawLog   consts{} verts{}", cs, vs);
+        }
+      }
+    }
 
     // Tessellated depth-only passes (a Z prepass) and the tessellated color
     // passes testing against their depth (GEQUAL / LEQUAL) are evaluated by
@@ -5455,6 +5554,13 @@ bool MetalCommandProcessor::IssueCopy() {
   // Finish any in-flight rendering so render target contents are visible to
   // resolve logic.
   EndRenderEncoder();
+  if (::cvars::metal_debug_flush_before_resolve) {
+    // Debug: finish all previously encoded GPU work before the resolve.
+    CommitAndWaitCurrentCommandBuffer();
+  } else if (::cvars::metal_debug_commit_before_resolve) {
+    // Debug: split the submission without waiting on the CPU.
+    EndCommandBuffer();
+  }
   MTL::CommandBuffer* copy_command_buffer = EnsureCommandBuffer();
   if (!copy_command_buffer) {
     XELOGE("MetalCommandProcessor::IssueCopy: failed to get command buffer");
@@ -5658,7 +5764,53 @@ void MetalCommandProcessor::DrainCommandBufferAutoreleasePool() {
   command_buffer_autorelease_pool_ = nullptr;
 }
 
+static bool MetalTitleInList(uint32_t title_id, const std::string& list) {
+  std::string id = fmt::format("{:08X}", title_id);
+  size_t pos = 0;
+  while (pos <= list.size()) {
+    size_t comma = list.find(',', pos);
+    std::string item = list.substr(
+        pos, comma == std::string::npos ? std::string::npos : comma - pos);
+    item.erase(0, item.find_first_not_of(" \t"));
+    item.erase(item.find_last_not_of(" \t") + 1);
+    if (!item.empty() && strcasecmp(item.c_str(), id.c_str()) == 0) {
+      return true;
+    }
+    if (comma == std::string::npos) {
+      break;
+    }
+    pos = comma + 1;
+  }
+  return false;
+}
+
 void MetalCommandProcessor::SyncGpuWritesForGuest() {
+  {
+    uint32_t title_id = current_title_id_.load(std::memory_order_relaxed);
+    if (title_id != sync_all_titles_checked_id_) {
+      sync_all_titles_checked_id_ = title_id;
+      sync_all_titles_match_ = MetalTitleInList(
+          title_id, ::cvars::metal_sync_all_gpu_work_for_guest_titles);
+      if (sync_all_titles_match_) {
+        XELOGI("Metal: full GPU work sync for guest enabled for title {:08X}",
+               title_id);
+      }
+    }
+    if (sync_all_titles_match_) {
+      // With zero-copy shared memory the GPU reads guest memory when it
+      // executes, not when commands are recorded - so the guest must not be
+      // told the GPU is done before it really is.
+      bool pending_work =
+          current_command_buffer_ != nullptr ||
+          completed_command_buffers_.load(std::memory_order_relaxed) <
+              submission_current_;
+      gpu_writes_pending_for_guest_ = false;
+      if (pending_work && EnsureCommandBuffer()) {
+        CommitAndWaitCurrentCommandBuffer();
+      }
+      return;
+    }
+  }
   if (!gpu_writes_pending_for_guest_) {
     return;
   }
@@ -5763,10 +5915,25 @@ void MetalCommandProcessor::NoteMemExportWritten() {
   }
 }
 
+void MetalCommandProcessor::SignalRenderTargetFence(
+    MTL::RenderCommandEncoder* encoder) {
+  if (encoder && render_target_fence_ && ::cvars::metal_render_target_fence) {
+    encoder->updateFence(render_target_fence_, MTL::RenderStageFragment);
+  }
+}
+
+void MetalCommandProcessor::WaitRenderTargetFence(
+    MTL::ComputeCommandEncoder* encoder) {
+  if (encoder && render_target_fence_ && ::cvars::metal_render_target_fence) {
+    encoder->waitForFence(render_target_fence_);
+  }
+}
+
 void MetalCommandProcessor::EndRenderEncoder() {
   if (!current_render_encoder_) {
     return;
   }
+  SignalRenderTargetFence(current_render_encoder_);
   current_render_encoder_->endEncoding();
   current_render_encoder_->release();
   current_render_encoder_ = nullptr;
@@ -6632,7 +6799,8 @@ MTL::RenderPipelineState* MetalCommandProcessor::GetOrCreatePipelineState(
   // Alpha to coverage is emulated in the pixel shader (SV_Coverage output
   // with the guest's dither offsets), like on D3D12 and Vulkan - hardware
   // alpha to coverage on top of it would apply it twice.
-  desc->setAlphaToCoverageEnabled(false);
+  desc->setAlphaToCoverageEnabled(
+      ::cvars::metal_hardware_alpha_to_coverage && key_data.alpha_to_mask_enable != 0);
 
   // Fixed-function blending and color write masks.
   // These are part of the render pipeline state, so the cache key must include
@@ -7368,7 +7536,8 @@ MetalCommandProcessor::GetOrCreateGeometryPipelineState(
   // Alpha to coverage is emulated in the pixel shader (SV_Coverage output
   // with the guest's dither offsets), like on D3D12 and Vulkan - hardware
   // alpha to coverage on top of it would apply it twice.
-  desc->setAlphaToCoverageEnabled(false);
+  desc->setAlphaToCoverageEnabled(
+      ::cvars::metal_hardware_alpha_to_coverage && key_data.alpha_to_mask_enable != 0);
 
   for (uint32_t i = 0; i < 4; ++i) {
     auto* color_attachment = desc->colorAttachments()->object(i);
@@ -8168,7 +8337,8 @@ MetalCommandProcessor::GetOrCreateTessellationPipelineState(
   // Alpha to coverage is emulated in the pixel shader (SV_Coverage output
   // with the guest's dither offsets), like on D3D12 and Vulkan - hardware
   // alpha to coverage on top of it would apply it twice.
-  desc->setAlphaToCoverageEnabled(false);
+  desc->setAlphaToCoverageEnabled(
+      ::cvars::metal_hardware_alpha_to_coverage && key_data.alpha_to_mask_enable != 0);
 
   for (uint32_t i = 0; i < 4; ++i) {
     auto* color_attachment = desc->colorAttachments()->object(i);
@@ -9208,7 +9378,8 @@ MetalCommandProcessor::GetOrCreateMslTessPipelineState(
   // Alpha to coverage is emulated in the pixel shader (SV_Coverage output
   // with the guest's dither offsets), like on D3D12 and Vulkan - hardware
   // alpha to coverage on top of it would apply it twice.
-  desc->setAlphaToCoverageEnabled(false);
+  desc->setAlphaToCoverageEnabled(
+      ::cvars::metal_hardware_alpha_to_coverage && key_data.alpha_to_mask_enable != 0);
   for (uint32_t i = 0; i < 4; ++i) {
     auto* color_attachment = desc->colorAttachments()->object(i);
     color_attachment->setPixelFormat(color_formats[i]);

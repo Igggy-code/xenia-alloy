@@ -9,9 +9,13 @@
 
 #include "xenia/cpu/ppc/ppc_translator.h"
 
+#include <cstdlib>
+#include <string>
+
 #include "xenia/base/assert.h"
 #include "xenia/base/byte_order.h"
 #include "xenia/base/cvar.h"
+#include "xenia/base/logging.h"
 #include "xenia/base/memory.h"
 #include "xenia/base/profiling.h"
 #include "xenia/base/reset_scope.h"
@@ -28,6 +32,10 @@
 DEFINE_bool(dump_translated_hir_functions, false, "dumps translated hir",
             "CPU");
 
+DEFINE_string(debug_disassemble_guest_functions, "",
+              "Comma-separated hex guest function addresses whose PowerPC "
+              "disassembly is logged when they are compiled (debugging).",
+              "CPU");
 DEFINE_bool(disable_context_promotion, false,
             "Disables Context Promotion optimizations, this may be needed for "
             "some sports games, but will reduce performance.",
@@ -191,6 +199,24 @@ bool PPCTranslator::Translate(GuestFunction* function,
   if (cvars::disassemble_functions) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoAllDisasm;
   }
+  bool log_disassembly = false;
+  if (!cvars::debug_disassemble_guest_functions.empty()) {
+    const std::string& list = cvars::debug_disassemble_guest_functions;
+    size_t pos = 0;
+    while (pos < list.size()) {
+      size_t end = list.find(',', pos);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      if (std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16) ==
+          function->address()) {
+        log_disassembly = true;
+        debug_info_flags |= DebugInfoFlags::kDebugInfoDisasmSource;
+        break;
+      }
+      pos = end + 1;
+    }
+  }
   if (cvars::trace_functions) {
     debug_info_flags |= DebugInfoFlags::kDebugInfoTraceFunctions;
   }
@@ -237,6 +263,10 @@ bool PPCTranslator::Translate(GuestFunction* function,
   // Stash source.
   if (debug_info_flags & DebugInfoFlags::kDebugInfoDisasmSource) {
     DumpSource(function, &string_buffer_);
+    if (log_disassembly) {
+      XELOGI("Guest function {:08X} disassembly:\n{}", function->address(),
+             string_buffer_.buffer());
+    }
     debug_info->set_source_disasm(xe_strdup(string_buffer_.buffer()));
     string_buffer_.Reset();
   }

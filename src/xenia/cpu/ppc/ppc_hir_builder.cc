@@ -10,7 +10,10 @@
 #include "xenia/cpu/ppc/ppc_hir_builder.h"
 
 #include <stddef.h>
+#include <atomic>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 
 #include "third_party/fmt/include/fmt/format.h"
 
@@ -28,15 +31,90 @@
 #include "xenia/cpu/ppc/ppc_opcode_info.h"
 #include "xenia/cpu/processor.h"
 #include "xenia/cpu/xex_module.h"
+#include "xenia/memory.h"
 DEFINE_bool(
     break_on_unimplemented_instructions, true,
     "Break to the host debugger (or crash if no debugger attached) if an "
     "unimplemented PowerPC instruction is encountered.",
     "CPU");
 
+DEFINE_string(debug_trace_guest_functions, "",
+              "Comma-separated hex guest function addresses; each entry into "
+              "them is logged with LR, r3-r6 and the first 0xC0 bytes at r3 "
+              "(debugging, rate-limited).",
+              "CPU");
+DEFINE_string(debug_trace_guest_watch, "",
+              "Comma-separated hex guest addresses whose 32-bit values are "
+              "added to each debug_trace_guest_functions log line.",
+              "CPU");
+
 namespace xe {
 namespace cpu {
 namespace ppc {
+
+namespace {
+bool IsTracedGuestFunction(uint32_t address) {
+  const std::string& list = cvars::debug_trace_guest_functions;
+  size_t pos = 0;
+  while (pos < list.size()) {
+    size_t end = list.find(',', pos);
+    if (end == std::string::npos) {
+      end = list.size();
+    }
+    if (std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16) ==
+        address) {
+      return true;
+    }
+    pos = end + 1;
+  }
+  return false;
+}
+
+void TraceGuestFunctionEntry(PPCContext* ctx, void* arg0, void* arg1) {
+  auto* memory = static_cast<Memory*>(arg0);
+  auto address = uint32_t(reinterpret_cast<uintptr_t>(arg1));
+  static std::atomic<uint32_t> count{0};
+  uint32_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
+  if (n > 200 && (n % 5000) != 0) {
+    return;
+  }
+  std::string text = fmt::format(
+      "GuestTrace #{} fn {:08X} thread {:X} lr {:08X} r3 {:08X} r4 {:08X} "
+      "r5 {:08X} r6 {:08X}",
+      n, address, ctx->thread_id, uint32_t(ctx->lr), uint32_t(ctx->r[3]),
+      uint32_t(ctx->r[4]), uint32_t(ctx->r[5]), uint32_t(ctx->r[6]));
+  {
+    const std::string& list = cvars::debug_trace_guest_watch;
+    size_t pos = 0;
+    while (pos < list.size()) {
+      size_t end = list.find(',', pos);
+      if (end == std::string::npos) {
+        end = list.size();
+      }
+      uint32_t watch = uint32_t(
+          std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 16));
+      if (watch >= 0x30000000u && watch < 0xFFFF0000u) {
+        text += fmt::format(
+            " [{:08X}]={:08X}", watch,
+            xe::load_and_swap<uint32_t>(
+                memory->TranslateVirtual<const uint8_t*>(watch)));
+      }
+      pos = end + 1;
+    }
+  }
+  uint32_t r3 = uint32_t(ctx->r[3]);
+  if (r3 >= 0x30000000u && r3 < 0xFFFF0000u) {
+    const uint8_t* host = memory->TranslateVirtual<const uint8_t*>(r3);
+    for (uint32_t i = 0; i < 0xC0; i += 4) {
+      if (!(i & 0x1F)) {
+        text += fmt::format("\n  +{:02X}:", i);
+      }
+      text += fmt::format(" {:08X}", xe::load_and_swap<uint32_t>(host + i));
+    }
+  }
+  XELOGI("{}", text);
+}
+}  // namespace
 
 // TODO(benvanik): remove when enums redefined.
 using namespace xe::cpu::hir;
@@ -116,6 +194,14 @@ bool PPCHIRBuilder::Emit(GuestFunction* function, uint32_t flags) {
 
   // Always mark entry with label.
   label_list_[0] = NewLabel();
+
+  if (!cvars::debug_trace_guest_functions.empty() &&
+      IsTracedGuestFunction(function_->address())) {
+    CallExtern(frontend_->processor()->DefineBuiltin(
+        fmt::format("__trace_{:08X}", function_->address()),
+        TraceGuestFunctionEntry, frontend_->memory(),
+        reinterpret_cast<void*>(uintptr_t(function_->address()))));
+  }
 
   uint32_t start_address = function_->address();
   uint32_t end_address = function_->end_address();

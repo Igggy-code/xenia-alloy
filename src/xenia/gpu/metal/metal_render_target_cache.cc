@@ -15,7 +15,9 @@
 #include <cstdlib>
 #include <array>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <limits>
 #include <string>
 #include <unordered_set>
@@ -71,6 +73,28 @@ DEFINE_bool(
     metal_transfer_msaa_sample_id, true,
     "Use sample_id in Metal transfer shaders for MSAA (sample-rate shading)",
     "GPU");
+DEFINE_uint32(metal_debug_log_resolves_every, 0,
+              "Debug: log every resolve (EDRAM to memory copy) of each Nth "
+              "frame (0 = off).",
+              "GPU");
+DEFINE_string(metal_debug_dump_dir, "",
+              "Debug: with metal_debug_log_resolves_every, write the "
+              "destination memory of every logged resolve (first 8 logged "
+              "frames) into this directory.",
+              "GPU");
+DEFINE_bool(metal_debug_dump_mark_top_rows, false,
+            "Debug: color render target dumps to EDRAM write magenta into the "
+            "top 48 rows (to check where resolved data comes from).",
+            "GPU");
+DEFINE_bool(metal_debug_skip_depth_to_color_transfers, false,
+            "Debug: skip EDRAM ownership transfers from depth to color render "
+            "targets.",
+            "GPU");
+DEFINE_int32(metal_debug_resolve_clear_white_base, -1,
+             "Debug: color clears done by resolves of the render target at "
+             "this EDRAM base (in tiles) use all-ones (white) instead of the "
+             "guest clear color. -1 = off.",
+             "GPU");
 DEFINE_int32(metal_memory_log_rate, 0,
              "Log Metal render target/pipeline/instance buffer sizes every N "
              "frames (0 to disable)",
@@ -80,6 +104,53 @@ DEFINE_int32(metal_memory_log_rate, 0,
 namespace xe {
 namespace gpu {
 namespace metal {
+
+namespace {
+struct LoggedResolve {
+  uint32_t address;
+  uint32_t length;
+  std::string meta;
+};
+std::vector<LoggedResolve> g_logged_resolves;
+}  // namespace
+
+// Called from MetalCommandProcessor::IssueSwap after the GPU has finished the
+// logged frame.
+void MetalDebugDumpLoggedResolves(Memory& memory, uint32_t swap) {
+  if (g_logged_resolves.empty()) {
+    return;
+  }
+  static uint32_t dumps_done = 0;
+  if (::cvars::metal_debug_dump_dir.empty() || dumps_done >= 8) {
+    g_logged_resolves.clear();
+    return;
+  }
+  ++dumps_done;
+  std::filesystem::path dir =
+      std::filesystem::path(::cvars::metal_debug_dump_dir) /
+      fmt::format("swap{}", swap);
+  std::error_code ec;
+  std::filesystem::create_directories(dir, ec);
+  std::string index;
+  for (size_t i = 0; i < g_logged_resolves.size(); ++i) {
+    const LoggedResolve& r = g_logged_resolves[i];
+    std::string name = fmt::format("{:03}_{:08X}.bin", i, r.address);
+    FILE* f = std::fopen((dir / name).string().c_str(), "wb");
+    if (f) {
+      std::fwrite(memory.TranslatePhysical(r.address), 1, r.length, f);
+      std::fclose(f);
+    }
+    index += name + " " + r.meta + "\n";
+  }
+  FILE* f = std::fopen((dir / "index.txt").string().c_str(), "wb");
+  if (f) {
+    std::fwrite(index.data(), 1, index.size(), f);
+    std::fclose(f);
+  }
+  XELOGI("ResolveLog: dumped {} resolves to {}", g_logged_resolves.size(),
+         dir.string());
+  g_logged_resolves.clear();
+}
 
 namespace {
 
@@ -1300,6 +1371,10 @@ kernel void edram_dump_color_32bpp_1xmsaa(
   // If source is a linear RGBA16Unorm gamma RT, convert to PWL gamma encoding
   if (constants.flags & kDumpFlagGammaAsLinear) {
     color.rgb = XeLinearToPWLGamma3(color.rgb);
+  }
+  // Debug (metal_debug_dump_mark_top_rows): mark the top 48 rows.
+  if ((constants.flags & 8u) && source_coord.y < 48u) {
+    color = float4(1.0f, 0.0f, 1.0f, 1.0f);
   }
 
   uint packed = XePackColor32bpp(constants.format, color);
@@ -4001,6 +4076,7 @@ void MetalRenderTargetCache::StoreTiledData(MTL::CommandBuffer* command_buffer,
       MTL::RenderCommandEncoder* render_encoder =
           command_buffer->renderCommandEncoder(resolve_desc);
       if (render_encoder) {
+        command_processor_.SignalRenderTargetFence(render_encoder);
         render_encoder->endEncoding();
         // render_encoder is autoreleased - do not release
       }
@@ -4064,6 +4140,21 @@ void MetalRenderTargetCache::DumpRenderTargets(
   std::vector<ResolveCopyDumpRectangle> rectangles;
   GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows,
                                  dump_pitch, rectangles);
+  if (uint32_t every = ::cvars::metal_debug_log_resolves_every) {
+    if (!(command_processor_.swap_count() % every)) {
+      XELOGI("DumpLog swap {} base {} row_length {} rows {} pitch {} rects {}",
+             command_processor_.swap_count(), dump_base, dump_row_length_used,
+             dump_rows, dump_pitch, rectangles.size());
+      for (const ResolveCopyDumpRectangle& log_rect : rectangles) {
+        XELOGI(
+            "DumpLog   rt {:08X} row_first {} rows {} first_start {} "
+            "last_end {}",
+            log_rect.render_target ? log_rect.render_target->key().key : 0,
+            log_rect.row_first, log_rect.rows, log_rect.row_first_start,
+            log_rect.row_last_end);
+      }
+    }
+  }
 
   XELOGGPU("MetalRenderTargetCache::DumpRenderTargets: {} rectangles to dump",
            rectangles.size());
@@ -4118,6 +4209,9 @@ void MetalRenderTargetCache::DumpRenderTargets(
   }
 
   MTL::ComputeCommandEncoder* encoder = cmd->computeCommandEncoder();
+  if (encoder) {
+    command_processor_.WaitRenderTargetFence(encoder);
+  }
   if (!encoder) {
     XELOGE("MetalRenderTargetCache::DumpRenderTargets: no compute encoder");
     // cmd is autoreleased from commandBuffer() - do not release
@@ -4155,6 +4249,9 @@ void MetalRenderTargetCache::DumpRenderTargets(
 
     uint32_t dump_format = GetMetalEdramDumpFormat(key);
     uint32_t dump_flags = 0;
+    if (::cvars::metal_debug_dump_mark_top_rows && !key.is_depth) {
+      dump_flags |= 8u;
+    }
     MTL::Texture* stencil_tex = nullptr;
     if (key.is_depth) {
       if (!::cvars::depth_float24_convert_in_pixel_shader &&
@@ -4631,9 +4728,52 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
     return true;
   }
 
+  // Clears the resolved EDRAM region if requested (RB_COPY_CONTROL). Like on
+  // D3D12 and Vulkan, this must be done even if there's nothing to copy -
+  // games use clear-only resolves, for instance, to clear letterbox areas
+  // (The Darkness).
+  auto perform_resolve_clear = [&]() {
+    if (!resolve_info.IsClearingDepth() && !resolve_info.IsClearingColor()) {
+      return;
+    }
+    Transfer::Rectangle clear_rectangle;
+    RenderTarget* clear_targets[2] = {};
+    std::vector<Transfer> clear_transfers[2];
+    if (PrepareHostRenderTargetsResolveClear(
+            resolve_info, clear_rectangle, clear_targets[0],
+            clear_transfers[0], clear_targets[1], clear_transfers[1])) {
+      uint64_t clear_values[2];
+      clear_values[0] = resolve_info.rb_depth_clear;
+      clear_values[1] = resolve_info.rb_color_clear |
+                        (uint64_t(resolve_info.rb_color_clear_lo) << 32);
+      if (::cvars::metal_debug_resolve_clear_white_base >= 0 &&
+          uint32_t(::cvars::metal_debug_resolve_clear_white_base) ==
+              resolve_info.color_edram_info.base_tiles) {
+        clear_values[1] = ~uint64_t(0);
+      }
+      PerformTransfersAndResolveClears(2, clear_targets, clear_transfers,
+                                       clear_values, &clear_rectangle,
+                                       command_buffer);
+    }
+  };
+
   bool is_depth = resolve_info.IsCopyingDepth();
 
   if (!resolve_info.copy_dest_extent_length) {
+    if (uint32_t every = ::cvars::metal_debug_log_resolves_every) {
+      if (!(command_processor_.swap_count() % every)) {
+        XELOGI(
+            "ResolveLog swap {} no-copy clear {} coord {:08X} h8 {} "
+            "copy_control {:08X} color_edram {:08X} depth_edram {:08X}",
+            command_processor_.swap_count(),
+            resolve_info.IsClearingColor() || resolve_info.IsClearingDepth(),
+            resolve_info.coordinate_info.packed, resolve_info.height_div_8,
+            resolve_info.rb_copy_control.value,
+            resolve_info.color_edram_info.packed,
+            resolve_info.depth_edram_info.packed);
+      }
+    }
+    perform_resolve_clear();
     return true;
   }
 
@@ -4877,6 +5017,36 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
 
             written_address = resolve_info.copy_dest_extent_start;
             written_length = resolve_info.copy_dest_extent_length;
+            if (uint32_t every = ::cvars::metal_debug_log_resolves_every) {
+              if (!(command_processor_.swap_count() % every)) {
+                XELOGI(
+                    "ResolveLog swap {} dest {:08X}+{:X} base {:08X} "
+                    "dest_info {:08X} dest_coord {:08X} coord {:08X} h8 {} "
+                    "copy_control {:08X} color_edram {:08X} depth_edram "
+                    "{:08X} shader {}",
+                    command_processor_.swap_count(), written_address,
+                    written_length, resolve_info.copy_dest_base,
+                    resolve_info.copy_dest_info.value,
+                    resolve_info.copy_dest_coordinate_info.packed,
+                    resolve_info.coordinate_info.packed,
+                    resolve_info.height_div_8,
+                    resolve_info.rb_copy_control.value,
+                    resolve_info.color_edram_info.packed,
+                    resolve_info.depth_edram_info.packed,
+                    uint32_t(copy_shader));
+                if (!::cvars::metal_debug_dump_dir.empty()) {
+                  g_logged_resolves.push_back(
+                      {written_address, written_length,
+                       fmt::format("dest_info={:08X} dest_coord={:08X} "
+                                   "coord={:08X} h8={} color_edram={:08X}",
+                                   resolve_info.copy_dest_info.value,
+                                   resolve_info.copy_dest_coordinate_info.packed,
+                                   resolve_info.coordinate_info.packed,
+                                   resolve_info.height_div_8,
+                                   resolve_info.color_edram_info.packed)});
+                }
+              }
+            }
 
             // Mark the shared memory range as GPU-written resolve data so
             // texture caches and trace dumping can see it without an extra
@@ -4901,26 +5071,7 @@ bool MetalRenderTargetCache::Resolve(Memory& memory, uint32_t& written_address,
             }
 
 
-            bool clear_depth = resolve_info.IsClearingDepth();
-            bool clear_color = resolve_info.IsClearingColor();
-            if (clear_depth || clear_color) {
-              Transfer::Rectangle clear_rectangle;
-              RenderTarget* clear_targets[2] = {};
-              std::vector<Transfer> clear_transfers[2];
-              if (PrepareHostRenderTargetsResolveClear(
-                      resolve_info, clear_rectangle, clear_targets[0],
-                      clear_transfers[0], clear_targets[1],
-                      clear_transfers[1])) {
-                uint64_t clear_values[2];
-                clear_values[0] = resolve_info.rb_depth_clear;
-                clear_values[1] =
-                    resolve_info.rb_color_clear |
-                    (uint64_t(resolve_info.rb_color_clear_lo) << 32);
-                PerformTransfersAndResolveClears(
-                    2, clear_targets, clear_transfers, clear_values,
-                    &clear_rectangle, command_buffer);
-              }
-            }
+            perform_resolve_clear();
             return true;
           }
         }
@@ -4942,6 +5093,43 @@ void MetalRenderTargetCache::PerformTransfersAndResolveClears(
     MTL::CommandBuffer* command_buffer) {
   if (!render_targets || !render_target_transfers) {
     return;
+  }
+  if (uint32_t every = ::cvars::metal_debug_log_resolves_every) {
+    if (!(command_processor_.swap_count() % every)) {
+      for (uint32_t i = 0; i < render_target_count; ++i) {
+        if (!render_targets[i]) {
+          continue;
+        }
+        for (const Transfer& transfer : render_target_transfers[i]) {
+          XELOGI(
+              "TransferLog swap {} draw {} dest {:08X} source {:08X} "
+              "host_depth {:08X} tiles {}..{}",
+              command_processor_.swap_count(),
+              command_processor_.current_draw_index(),
+              render_targets[i]->key().key,
+              transfer.source ? transfer.source->key().key : 0,
+              transfer.host_depth_source
+                  ? transfer.host_depth_source->key().key
+                  : 0,
+              transfer.start_tiles, transfer.end_tiles);
+        }
+      }
+    }
+  }
+  // Debug (metal_debug_skip_depth_to_color_transfers).
+  std::vector<Transfer> filtered_transfers[1 + xenos::kMaxColorRenderTargets];
+  if (::cvars::metal_debug_skip_depth_to_color_transfers &&
+      render_target_count <= 1 + xenos::kMaxColorRenderTargets) {
+    for (uint32_t i = 0; i < render_target_count; ++i) {
+      for (const Transfer& transfer : render_target_transfers[i]) {
+        if (render_targets[i] && !render_targets[i]->key().is_depth &&
+            transfer.source && transfer.source->key().is_depth) {
+          continue;
+        }
+        filtered_transfers[i].push_back(transfer);
+      }
+    }
+    render_target_transfers = filtered_transfers;
   }
 
   bool resolve_clear_needed =
@@ -6871,6 +7059,7 @@ void MetalRenderTargetCache::PerformTransfersAndResolveClears(
     }
 
     if (transfer_encoder) {
+      command_processor_.SignalRenderTargetFence(transfer_encoder);
       transfer_encoder->endEncoding();
     }
   }
