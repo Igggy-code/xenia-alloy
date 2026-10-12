@@ -138,10 +138,17 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
   }
 
   // Find the device.
-  auto it = std::ranges::find_if(std::as_const(devices_), [&](const auto& d) {
-    return xe::utf8::starts_with(normalized_path, d->mount_path());
-  });
-  if (it == devices_.cend()) {
+  Device* device = nullptr;
+  for (const auto& candidate : devices_) {
+    const auto& mount = candidate->mount_path();
+    if (!mount.empty() && xe::utf8::starts_with(normalized_path, mount) &&
+        (normalized_path.size() == mount.size() || mount.back() == '\\' ||
+         normalized_path[mount.size()] == '\\') &&
+        (!device || mount.size() > device->mount_path().size())) {
+      device = candidate.get();
+    }
+  }
+  if (!device) {
     // Supress logging the error for ShaderDumpxe:\CompareBackEnds as this is
     // not an actual problem nor something we care about.
     if (path != "ShaderDumpxe:\\CompareBackEnds") {
@@ -150,38 +157,31 @@ Entry* VirtualFileSystem::ResolvePath(const std::string_view path) {
     return nullptr;
   }
 
-  const auto& device = *it;
   auto relative_path = normalized_path.substr(device->mount_path().size());
   return device->ResolvePath(relative_path);
 }
 
 Entry* VirtualFileSystem::CreatePath(const std::string_view path,
                                      uint32_t attributes) {
-  // Create all required directories recursively.
-  auto path_parts = xe::utf8::split_path(path);
-  if (path_parts.empty()) {
+  auto global_lock = global_critical_region_.Acquire();
+  const auto normalized_path = xe::utf8::canonicalize_guest_path(path);
+  const auto parent_path = xe::utf8::find_base_guest_path(normalized_path);
+  if (parent_path.empty()) {
     return nullptr;
   }
-  auto partial_path = std::string(path_parts[0]);
-  auto partial_entry = ResolvePath(partial_path);
-  if (!partial_entry) {
-    return nullptr;
+
+  // Start at the nearest existing parent, which may itself be a mounted
+  // device. Splitting from the first component loses the leading backslash
+  // in absolute paths and tries to resolve an unmounted "Device" directory.
+  auto parent_entry = ResolvePath(parent_path);
+  if (!parent_entry) {
+    parent_entry = CreatePath(parent_path, kFileAttributeDirectory);
   }
-  auto parent_entry = partial_entry;
-  for (size_t i = 1; i < path_parts.size() - 1; ++i) {
-    partial_path = xe::utf8::join_guest_paths(partial_path, path_parts[i]);
-    auto child_entry = ResolvePath(partial_path);
-    if (!child_entry) {
-      child_entry =
-          parent_entry->CreateEntry(path_parts[i], kFileAttributeDirectory);
-    }
-    if (!child_entry) {
-      return nullptr;
-    }
-    parent_entry = child_entry;
-  }
-  return parent_entry->CreateEntry(path_parts[path_parts.size() - 1],
-                                   attributes);
+  return parent_entry
+             ? parent_entry->CreateEntry(
+                   xe::utf8::find_name_from_guest_path(normalized_path),
+                   attributes)
+             : nullptr;
 }
 
 bool VirtualFileSystem::DeletePath(const std::string_view path) {
@@ -242,19 +242,12 @@ X_STATUS VirtualFileSystem::OpenFile(Entry* root_entry,
       return X_STATUS_FILE_IS_A_DIRECTORY;
     }
 
-    // If the entry does not exist on the host then remove the cached entry
-    if (parent_entry) {
-      const xe::vfs::HostPathEntry* host_path =
-          dynamic_cast<const xe::vfs::HostPathEntry*>(parent_entry);
-
-      if (host_path) {
-        auto const file_path = host_path->host_path() / entry->name();
-
-        if (!std::filesystem::exists(file_path)) {
-          // Remove cached entry
-          entry->Delete();
-          entry = nullptr;
-        }
+    // Use the entry's backing path: a directory may be backed by a host
+    // folder outside its parent's host directory.
+    if (auto host_entry = dynamic_cast<const HostPathEntry*>(entry)) {
+      if (!std::filesystem::exists(host_entry->host_path())) {
+        entry->Delete();
+        entry = nullptr;
       }
     }
   }

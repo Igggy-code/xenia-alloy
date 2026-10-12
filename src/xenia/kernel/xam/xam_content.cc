@@ -23,6 +23,7 @@
 #include "xenia/kernel/xenumerator.h"
 #include "xenia/ui/imgui_dialog.h"
 #include "xenia/ui/imgui_drawer.h"
+#include "xenia/vfs/devices/host_path_entry.h"
 #include "xenia/vfs/devices/stfs_xbox.h"
 #include "xenia/xbox.h"
 
@@ -140,8 +141,20 @@ dword_result_t xeXamContentResolve(
         static_cast<uint32_t>(content_data.content_type.get()),
         content_data.file_name());
 
-    string_util::copy_truncating(path_ptr, root_device_path + relative_path,
-                                 path_size);
+    const std::string resolved_path = root_device_path + relative_path;
+    if (create_directory) {
+      // Observed with title 4D53084D: the installer requests directory
+      // creation for the HDD destination, then copies the package with
+      // NtCreateFile/NtWriteFile. Create the package file's parent directory.
+      auto filesystem = kernel_state()->file_system();
+      const auto directory = xe::utf8::find_base_guest_path(resolved_path);
+      if (!filesystem->ResolvePath(directory) &&
+          !filesystem->CreatePath(directory, vfs::kFileAttributeDirectory)) {
+        return X_ERROR_ACCESS_DENIED;
+      }
+    }
+
+    string_util::copy_truncating(path_ptr, resolved_path, path_size);
 
     // Check if it exists and try to mount that package
     // Result of buffer_ptr is sent to RtlInitAnsiString.
@@ -865,13 +878,20 @@ dword_result_t xeXamContentLaunchImage(dword_t user_index,
     return X_STATUS_NO_SUCH_FILE;
   }
 
-  const std::filesystem::path host_path =
-      kernel_state()->emulator()->content_root() / entry->name();
-
-  if (!std::filesystem::exists(host_path)) {
-    uint64_t progress = 0;
-    vfs::VirtualFileSystem::ExtractDeviceFile(
-        entry, kernel_state()->emulator()->content_root(), progress, true);
+  std::filesystem::path host_path;
+  if (auto host_entry = dynamic_cast<vfs::HostPathEntry*>(entry)) {
+    // Mount host-backed packages directly from their resolved guest entry.
+    host_path = host_entry->host_path();
+  } else {
+    host_path = kernel_state()->emulator()->content_root() / entry->name();
+    if (!std::filesystem::exists(host_path)) {
+      uint64_t progress = 0;
+      const auto result = vfs::VirtualFileSystem::ExtractDeviceFile(
+          entry, kernel_state()->emulator()->content_root(), progress, true);
+      if (result != X_STATUS_SUCCESS) {
+        return result;
+      }
+    }
   }
 
   auto xam = kernel_state()->GetKernelModule<XamModule>("xam.xex");
